@@ -175,7 +175,7 @@ func TestClientTLS13(t *testing.T) {
 	}
 	tlsInitCSV()
 	_, _, _, _, err :=
-		testClientConnWithDC(t, clientMsg, serverAddress+":4433",
+		testClientConnWithDC(t, clientMsg, serverAddress+":4432",
 			clientConfig, serverMsg, true, false)
 	if err != nil {
 		t.Errorf("test with kem #%d fails: %s",
@@ -205,7 +205,7 @@ func TestServerTLS13(t *testing.T) {
 	}
 	tlsServerInitCSV()
 	_, _, _, _, err :=
-		testServerConnWithDC(t, clientMsg, serverMsg, ":4433",
+		testServerConnWithDC(t, clientMsg, serverMsg, ":4432",
 			serverConfig, true, false)
 	if err != nil {
 		t.Errorf("test with kem #%d fails: %s",
@@ -474,24 +474,21 @@ func TestClientMpk1(t *testing.T) {
 
 func TestClientKEMTLSIBE2(t *testing.T) {
 	var timingStateClient timingInfo
-	var timingStateServer timingInfo
 	initHybridCert(ibeTestConfig)
-	serverMsg := "hello, client"
 	clientMsg := "hello, server"
+	serverMsg := "hello, client"
 	clientConfig := ibeTestConfig.Clone()
 	clientConfig.Certificates = nil
-	serverConfig := ibeTestConfig.Clone()
-	clientConfig.CFEventHandler = timingStateClient.eventHandler
-	serverConfig.CFEventHandler = timingStateServer.eventHandler
 	clientConfig.KEMTLSEnabled = true
-	serverConfig.KEMTLSEnabled = true
 	clientConfig.CurvePreferences = []CurveID{P384_Kyber768}
-	serverConfig.CurvePreferences = []CurveID{P384_Kyber768}
-	serverConfig.Certificates = make([]Certificate, 1)
-	serverConfig.Certificates[0] = hybridCert
+	//clientConfig.InsecureSkipVerify = true
 	combiner := new(xormac.Combiner)
-	serverConfig.ServerName = "localhost"
 	clientConfig.ServerName = "localhost"
+	clientConfig.CFEventHandler = timingStateClient.eventHandler
+	serverAddress := os.Getenv("TLSSERVER")
+	if serverAddress == "" {
+		serverAddress = "localhost"
+	}
 	scheme, err := combiner.NewScheme(new(ec.Scheme), new(dlp.Scheme))
 	if err != nil {
 		t.Error(err)
@@ -500,91 +497,54 @@ func TestClientKEMTLSIBE2(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	serverConfig.SkID, err = kdc.Extract(serverConfig.ServerName)
+	clientConfig.Mpk, err = kdc.MasterPublic()
 	if err != nil {
 		t.Error(err)
 	}
-	serverConfig.Mpk, err = kdc.MasterPublic()
-	if err != nil {
-		t.Error(err)
-	}
-	clientConfig.Mpk = serverConfig.Mpk
 	kemtlsInitCSV()
-	kemtlsInitCSVServer()
-	for i, test := range hybridIBEServerTests {
-		clientConfig.SupportDelegatedCredential = test.clientDCSupport
-		for dcCount = 0; dcCount < len(ibeTestKEMScheme); dcCount++ {
-			initDCTest()
-			//serverConfig.GetCertificate = testServerHybridIBEHybridCertificate
-			clientConfig.MaxVersion = test.clientMaxVers
-			serverConfig.MaxVersion = test.serverMaxVers
-			_, _, _, serverState, clientState, err :=
-				testConnWithDC(t, clientMsg, serverMsg,
-					clientConfig, serverConfig, "client",
-					true, false)
-			if err != nil {
-				t.Errorf("test #%d (%s) with kem #%d fails: %s",
-					i, test.name, dcCount, err.Error())
-			}
-			timingsFullProtocolClient := float64(timingStateClient.clientTimingInfo.FullProtocol) / float64(time.Millisecond)
-			timingsSendAppData := float64(timingStateClient.clientTimingInfo.SendAppData) / float64(time.Millisecond)
-			timingsProcessServerHello := float64(timingStateClient.clientTimingInfo.ProcessServerHello) / float64(time.Millisecond)
-			timingsWriteClientHello := float64(timingStateClient.clientTimingInfo.WriteClientHello) / float64(time.Millisecond)
-			timingsWriteKEMCiphertext := float64(timingStateClient.clientTimingInfo.WriteKEMCiphertext) / float64(time.Millisecond)
-			handshakeSizes := make(map[string]uint32)
-			handshakeSizes["ClientHello"] = clientState.ClientHandshakeSizes.ClientHello
-			handshakeSizes["ClientKEMCiphertext"] = clientState.ClientHandshakeSizes.ClientKEMCiphertext
-			handshakeSizes["ClientCertificate"] = clientState.ClientHandshakeSizes.Certificate
-			handshakeSizes["Finished"] = clientState.ClientHandshakeSizes.Finished
-			timingsFullProtocolServer := float64(timingStateServer.serverTimingInfo.FullProtocol) / float64(time.Millisecond)
-			timingsWriteServerHello := float64(timingStateServer.serverTimingInfo.WriteServerHello) / float64(time.Millisecond)
-			//timingsWriteCertVerify = float64(timingStateServer.serverTimingInfo.WriteCertificateVerify) / float64(time.Millisecond)
-			timingsReadKEMCiphertext := float64(timingStateServer.serverTimingInfo.ReadKEMCiphertext) / float64(time.Millisecond)
-			handshakeSizes["ServerHello"] = serverState.ServerHandshakeSizes.ServerHello
-			handshakeSizes["EncryptedExtensions"] = serverState.ServerHandshakeSizes.EncryptedExtensions
-			handshakeSizes["Certificate"] = serverState.ServerHandshakeSizes.Certificate
-			handshakeSizes["CertificateRequest"] = serverState.ServerHandshakeSizes.CertificateRequest
-			handshakeSizes["CertificateVerify"] = serverState.ServerHandshakeSizes.CertificateVerify
-			handshakeSizes["Finished"] = serverState.ServerHandshakeSizes.Finished
-			kemtlsSaveCSV("Local IBE-KEM 384", timingsFullProtocolClient, timingsSendAppData, timingsProcessServerHello, timingsWriteClientHello, timingsWriteKEMCiphertext, handshakeSizes)
-			kemtlsSaveCSVServer("Local IBE-KEM 384", timingsFullProtocolServer, timingsWriteServerHello, timingsReadKEMCiphertext, handshakeSizes)
-			// Preparing pre-distributed key test
-			clientConfig.CachedCert = clientState.CertificateMessage
-			clientConfig.CachedCertReq = clientState.CertificateReqMessage
-			serverConfig.CachedCert = serverState.CertificateMessage
-			serverConfig.CachedCertReq = serverState.CertificateReqMessage
-			_, _, _, _, _, err =
-				testConnWithDC(t, clientMsg, serverMsg,
-					clientConfig, serverConfig, "client",
-					true, false)
-			if err != nil {
-				t.Errorf("test #%d (%s) with kem #%d fails: %s",
-					i, test.name, dcCount, err.Error())
-			}
-			timingsFullProtocolClient = float64(timingStateClient.clientTimingInfo.FullProtocol) / float64(time.Millisecond)
-			timingsSendAppData = float64(timingStateClient.clientTimingInfo.SendAppData) / float64(time.Millisecond)
-			timingsProcessServerHello = float64(timingStateClient.clientTimingInfo.ProcessServerHello) / float64(time.Millisecond)
-			timingsWriteClientHello = float64(timingStateClient.clientTimingInfo.WriteClientHello) / float64(time.Millisecond)
-			timingsWriteKEMCiphertext = float64(timingStateClient.clientTimingInfo.WriteKEMCiphertext) / float64(time.Millisecond)
-			handshakeSizes = make(map[string]uint32)
-			handshakeSizes["ClientHello"] = clientState.ClientHandshakeSizes.ClientHello
-			handshakeSizes["ClientKEMCiphertext"] = clientState.ClientHandshakeSizes.ClientKEMCiphertext
-			handshakeSizes["ClientCertificate"] = clientState.ClientHandshakeSizes.Certificate
-			handshakeSizes["Finished"] = clientState.ClientHandshakeSizes.Finished
-			timingsFullProtocolServer = float64(timingStateServer.serverTimingInfo.FullProtocol) / float64(time.Millisecond)
-			timingsWriteServerHello = float64(timingStateServer.serverTimingInfo.WriteServerHello) / float64(time.Millisecond)
-			//timingsWriteCertVerify = float64(timingStateServer.serverTimingInfo.WriteCertificateVerify) / float64(time.Millisecond)
-			timingsReadKEMCiphertext = float64(timingStateServer.serverTimingInfo.ReadKEMCiphertext) / float64(time.Millisecond)
-			handshakeSizes["ServerHello"] = serverState.ServerHandshakeSizes.ServerHello
-			handshakeSizes["EncryptedExtensions"] = serverState.ServerHandshakeSizes.EncryptedExtensions
-			handshakeSizes["Certificate"] = serverState.ServerHandshakeSizes.Certificate
-			handshakeSizes["CertificateRequest"] = serverState.ServerHandshakeSizes.CertificateRequest
-			handshakeSizes["CertificateVerify"] = serverState.ServerHandshakeSizes.CertificateVerify
-			handshakeSizes["Finished"] = serverState.ServerHandshakeSizes.Finished
-			kemtlsSaveCSV("Local PDK IBE-KEM 384", timingsFullProtocolClient, timingsSendAppData, timingsProcessServerHello, timingsWriteClientHello, timingsWriteKEMCiphertext, handshakeSizes)
-			kemtlsSaveCSVServer("Local PDK IBE-KEM 384", timingsFullProtocolServer, timingsWriteServerHello, timingsReadKEMCiphertext, handshakeSizes)
-		}
+
+	buf := make([]byte, len(serverMsg))
+	client, err := Dial("tcp", serverAddress+":4434", clientConfig)
+	if err != nil {
+		fmt.Printf("CONN FAIL: %v\n", err)
+		t.Error("")
 	}
+	defer client.Close()
+	client.Write([]byte(clientMsg))
+	_, err = client.Read(buf)
+	clientState := client.ConnectionState()
+	if !clientState.DidKEMTLS {
+		fmt.Printf("IBE KEMTLS FAILED\n")
+		t.Error("")
+	}
+	clientConfig.CachedCert = clientState.CertificateMessage
+	clientConfig.CachedCertReq = clientState.CertificateReqMessage
+	client, err = Dial("tcp", serverAddress+":4434", clientConfig)
+	if err != nil {
+		fmt.Printf("CONN FAIL: %v\n", err)
+		t.Error("")
+	}
+	defer client.Close()
+	client.Write([]byte(clientMsg))
+	_, err = client.Read(buf)
+	clientState = client.ConnectionState()
+	if clientState.DidKEMTLS {
+		timingsFullProtocolClient := float64(timingStateClient.clientTimingInfo.FullProtocol) / float64(time.Millisecond)
+		timingsSendAppData := float64(timingStateClient.clientTimingInfo.SendAppData) / float64(time.Millisecond)
+		timingsProcessServerHello := float64(timingStateClient.clientTimingInfo.ProcessServerHello) / float64(time.Millisecond)
+		timingsWriteClientHello := float64(timingStateClient.clientTimingInfo.WriteClientHello) / float64(time.Millisecond)
+		timingsWriteKEMCiphertext := float64(timingStateClient.clientTimingInfo.WriteKEMCiphertext) / float64(time.Millisecond)
+		handshakeSizes := make(map[string]uint32)
+		handshakeSizes["ClientHello"] = clientState.ClientHandshakeSizes.ClientHello
+		handshakeSizes["ClientKEMCiphertext"] = clientState.ClientHandshakeSizes.ClientKEMCiphertext
+		handshakeSizes["ClientCertificate"] = clientState.ClientHandshakeSizes.Certificate
+		handshakeSizes["Finished"] = clientState.ClientHandshakeSizes.Finished
+		kemtlsSaveCSV("KEMTLS-IBE-PDK 384", timingsFullProtocolClient, timingsSendAppData, timingsProcessServerHello, timingsWriteClientHello, timingsWriteKEMCiphertext, handshakeSizes)
+	} else {
+		fmt.Printf("IBE KEMTLS FAILED\n")
+		t.Error("")
+	}
+
 }
 
 func TestServerKEMTLSIBE2(t *testing.T) {
@@ -620,7 +580,7 @@ func TestServerKEMTLSIBE2(t *testing.T) {
 	kemtlsInitCSVServer()
 
 	wg.Add(1)
-	go testConnHybrid(clientMsg, serverMsg, serverConfig, "server", "", "4433")
+	go testConnHybrid(clientMsg, serverMsg, serverConfig, "server", "", "4434")
 	wg.Wait()
 }
 
@@ -656,7 +616,7 @@ func TestServerMpk2(t *testing.T) {
 	}
 	kemtlsInitCSVServer()
 	wg.Add(1)
-	go testConnHybrid(clientMsg, serverMsg, serverConfig, "server", "", "4434")
+	go testConnHybrid(clientMsg, serverMsg, serverConfig, "server", "", "4435")
 	wg.Wait()
 }
 
@@ -691,7 +651,7 @@ func TestClientMpk2(t *testing.T) {
 	kemtlsInitCSV()
 
 	buf := make([]byte, len(serverMsg))
-	client, err := Dial("tcp", serverAddress+":4434", clientConfig)
+	client, err := Dial("tcp", serverAddress+":4435", clientConfig)
 	if err != nil {
 		fmt.Printf("CONN FAIL: %v\n", err)
 		t.Error("")
