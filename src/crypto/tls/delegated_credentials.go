@@ -131,7 +131,8 @@ func (cred *credential) marshalPublicKeyInfo() ([]byte, error) {
 		ECDSAWithP521AndSHA512,
 		Ed25519, Ed448,
 		KEMTLSWithSIKEp434, KEMTLSWithKyber512,
-		PQTLSWithDilithium3, PQTLSWithDilithium4:
+		PQTLSWithDilithium3, PQTLSWithDilithium4,
+		isLiboqsKEMSignature(cred.expCertVerfAlgo):
 		rawPub, err := x509.MarshalPKIXPublicKey(cred.publicKey)
 		if err != nil {
 			return nil, err
@@ -394,6 +395,11 @@ func NewDelegatedCredential(cert *Certificate, pubAlgo SignatureScheme, validTim
 	case PQTLSWithDilithium4:
 		scheme := schemes.ByName("Ed448-Dilithium4")
 		pubK, privK, err = scheme.GenerateKey()
+		if err != nil {
+			return nil, nil, err
+		}
+	case isLiboqsKEMSignature(pubAlgo):
+		pubK, privK, err = kem.GenerateKey(rand.Reader, liboqsKEMFromSignature(pubAlgo))
 		if err != nil {
 			return nil, nil, err
 		}

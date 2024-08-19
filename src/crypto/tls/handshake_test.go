@@ -429,6 +429,82 @@ func testHandshake(t *testing.T, clientConfig, serverConfig *Config) (serverStat
 	return
 }
 
+func TestSimpleClient(t *testing.T) {
+	serverMsg := "hello, client"
+	clientMsg := "hello, server"
+	clientConfig := testConfig.Clone()
+	clientConfig.InsecureSkipVerify = true
+	serverAddress := os.Getenv("TLSSERVER")
+	if serverAddress == "" {
+		serverAddress = "localhost"
+	}
+	client, err := Dial("tcp", serverAddress+":8080", clientConfig)
+	//client, err := Dial("tcp", "localhost:8080", clientConfig)
+	if err != nil {
+		t.Errorf("Failed")
+	}
+	defer client.Close()
+	bufLen := len(clientMsg)
+	buf := make([]byte, bufLen)
+	client.Write([]byte(clientMsg))
+	n, err := client.Read(buf)
+	if n != len(serverMsg) || err != nil || string(buf[:n]) != serverMsg {
+		t.Errorf("Failed 2")
+	}
+}
+
+func testServerCertificate(ch *ClientHelloInfo) (*Certificate, error) {
+	cert, err := X509KeyPair([]byte(delegatorCertPEMP256), []byte(delegatorKeyPEMP256))
+	if err != nil {
+		return nil, err
+	}
+	return &cert, nil
+}
+
+func TestSimpleServer(t *testing.T) {
+	serverMsg := "hello, client"
+	clientMsg := "hello, server"
+	serverConfig := testConfig.Clone()
+	serverConfig.Certificates = nil
+	serverConfig.GetCertificate = testServerCertificate
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverCh := make(chan *Conn, 1)
+	go func() {
+		serverConn, err := ln.Accept()
+		if err != nil {
+			serverCh <- nil
+			return
+		}
+		server := Server(serverConn, serverConfig)
+		if err := server.Handshake(); err != nil {
+			serverCh <- nil
+			return
+		}
+		serverCh <- server
+	}()
+	server := <-serverCh
+	if server == nil {
+		t.Errorf("Error server 1")
+	}
+
+	bufLen := len(clientMsg)
+	if len(serverMsg) > len(clientMsg) {
+		bufLen = len(serverMsg)
+	}
+	buf := make([]byte, bufLen)
+
+	n, err := server.Read(buf)
+	if err != nil || n != len(clientMsg) || string(buf[:n]) != clientMsg {
+		t.Errorf("Error server 2")
+	}
+
+	server.Write([]byte(serverMsg))
+}
+
 func fromHex(s string) []byte {
 	b, _ := hex.DecodeString(s)
 	return b

@@ -5,10 +5,10 @@
 package tls
 
 import (
-	"crypto"
-	"testing"
-
 	circlPki "circl/pki"
+	"crypto"
+
+	"testing"
 )
 
 func TestSignatureSelection(t *testing.T) {

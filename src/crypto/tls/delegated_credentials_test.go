@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"testing"
 	"time"
 )
@@ -21,7 +22,6 @@ import (
 // crypto/tls directory:
 //
 //	go run generate_cert.go -ecdsa-curve P256 -host 127.0.0.1 -allowDC
-//
 var delegatorCertPEMP256 = `-----BEGIN CERTIFICATE-----
 MIIBejCCAR+gAwIBAgIQKEg6iMq02QUu7QZSZJ/qjzAKBggqhkjOPQQDAjASMRAw
 DgYDVQQKEwdBY21lIENvMB4XDTIxMDIyNzAwMTYwMVoXDTIyMDIyNzAwMTYwMVow
@@ -544,7 +544,6 @@ func testConnWithDC(t *testing.T, clientMsg, serverMsg string, clientConfig, ser
 		}
 		serverCh <- server
 	}()
-
 	var state ConnectionState
 	client, err := Dial("tcp", ln.Addr().String(), clientConfig)
 	if err != nil {
@@ -605,6 +604,84 @@ func testConnWithDC(t *testing.T, clientMsg, serverMsg string, clientConfig, ser
 	return false, false, false, state, state, nil
 }
 
+func testServerConnWithDC(t *testing.T, clientMsg, serverMsg, addr string, serverConfig *Config, kemtls bool, pqtls bool) (usedDC bool, usedKEMTLS bool, usedPQTLS bool, serverState ConnectionState, err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverCh := make(chan *Conn, 1)
+	var serverErr error
+	go func() {
+		serverConn, err := ln.Accept()
+		if err != nil {
+			serverErr = err
+			serverCh <- nil
+			return
+		}
+		server := Server(serverConn, serverConfig)
+		if err := server.Handshake(); err != nil {
+			serverErr = fmt.Errorf("handshake error: %v", err)
+			serverCh <- nil
+			return
+		}
+		serverCh <- server
+	}()
+	var state ConnectionState
+	server := <-serverCh
+	if server == nil {
+		return false, false, false, state, serverErr
+	}
+
+	bufLen := len(clientMsg)
+	if len(serverMsg) > len(clientMsg) {
+		bufLen = len(serverMsg)
+	}
+	buf := make([]byte, bufLen)
+
+	n, err := server.Read(buf)
+	if err != nil || n != len(clientMsg) || string(buf[:n]) != clientMsg {
+		return false, false, false, state, fmt.Errorf("Server read = %d, buf= %q; want %d, %s", n, buf, len(clientMsg), clientMsg)
+	}
+
+	server.Write([]byte(serverMsg))
+	if kemtls {
+		return (server.verifiedDC != nil), server.didKEMTLS, false, server.ConnectionState(), nil
+	} else if pqtls {
+		return (server.verifiedDC != nil), false, server.didPQTLS, state, nil
+	} else {
+		return (server.verifiedDC != nil), false, false, state, nil
+	}
+
+	return false, false, false, state, nil
+}
+
+func testClientConnWithDC(t *testing.T, clientMsg, addr string, clientConfig *Config, serverMsg string, kemtls bool, pqtls bool) (usedDC bool, usedKEMTLS bool, usedPQTLS bool, clientState ConnectionState, err error) {
+	var state ConnectionState
+	client, err := Dial("tcp", addr, clientConfig)
+	if err != nil {
+		return false, false, false, state, err
+	}
+	defer client.Close()
+	bufLen := len(clientMsg)
+	buf := make([]byte, bufLen)
+	client.Write([]byte(clientMsg))
+	n, err := client.Read(buf)
+	if n != len(serverMsg) || err != nil || string(buf[:n]) != serverMsg {
+		return false, false, false, state, fmt.Errorf("Client read = %d, %v, data %q; want %d, nil, %s", n, err, buf, len(serverMsg), serverMsg)
+	}
+
+	if kemtls {
+		return (client.verifiedDC != nil), client.didKEMTLS, false, client.ConnectionState(), nil
+	} else if pqtls {
+		return (client.verifiedDC != nil), false, client.didPQTLS, state, nil
+	} else {
+		return (client.verifiedDC != nil), false, false, state, nil
+	}
+	return false, false, false, state, nil
+}
+
 // Test the server authentication with the Delegated Credential extension.
 func TestDCHandshakeServerAuth(t *testing.T) {
 	serverMsg := "hello, client"
@@ -622,7 +699,6 @@ func TestDCHandshakeServerAuth(t *testing.T) {
 			serverConfig.GetCertificate = testServerGetCertificate
 			clientConfig.MaxVersion = test.clientMaxVers
 			serverConfig.MaxVersion = test.serverMaxVers
-
 			usedDC, _, _, _, _, err := testConnWithDC(t, clientMsg, serverMsg, clientConfig, serverConfig, "client", false, false)
 
 			if err != nil && test.expectSuccess {
@@ -790,7 +866,6 @@ func TestDCKEMHandshakeServerAuth(t *testing.T) {
 			serverConfig.GetCertificate = testServerGetKEMCertificate
 			clientConfig.MaxVersion = test.clientMaxVers
 			serverConfig.MaxVersion = test.serverMaxVers
-
 			usedDC, usedKEMTLS, _, _, _, err := testConnWithDC(t, clientMsg, serverMsg, clientConfig, serverConfig, "client", true, false)
 
 			if err != nil && test.expectSuccess {

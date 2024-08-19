@@ -9,12 +9,18 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/kem"
+	"crypto/liboqs_sig"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner/xorMac"
+	dlp "gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/idkem/dlp2"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/kem/ec"
 	"hash"
 	"io"
 	"net"
@@ -108,8 +114,8 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 	if len(config.CachedCert) > 0 {
 		cachedCert = true
 		cachedCertHash = calculateHashCachedInfo(config.CachedCert)
-
-		if config.KEMTLSEnabled {
+		// LabSEC: Added 'config.HybridIBEKEMTLSEnabled'
+		if config.KEMTLSEnabled || config.HybridIBEKEMTLSEnabled {
 			certMsg := new(certificateMsgTLS13)
 			data := append([]byte(nil), config.CachedCert...)
 
@@ -130,16 +136,29 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 			if err := c.verifyServerCertificate(certMsg.certificate.Certificate); err != nil {
 				return nil, nil, nil, err
 			}
-
 			if isKEMTLSAuthUsed(c.peerCertificates[0], certMsg.certificate) {
+				var pk *kem.PublicKey
+				var ok bool
+
 				if certMsg.delegatedCredential {
 					if err := processCachedDelegatedCredentialFromServer(c, config.SupportDelegatedCredential, certMsg.certificate.DelegatedCredential, nil); err != nil {
 						return nil, nil, nil, err
 					}
-				}
-				pk, ok := c.verifiedDC.cred.publicKey.(*kem.PublicKey)
-				if !ok {
-					return nil, nil, nil, errors.New("tls: invalid key")
+
+					pk, ok = c.verifiedDC.cred.publicKey.(*kem.PublicKey)
+					if !ok {
+						return nil, nil, nil, errors.New("tls: invalid key")
+					}
+				} else {
+					x509Cert, err := x509.ParseCertificate(certMsg.certificate.Certificate[0])
+					if err != nil {
+						return nil, nil, nil, errors.New("tls: invalid key")
+					}
+
+					pk, ok = x509Cert.PublicKey.(*kem.PublicKey)
+					if !ok {
+						return nil, nil, nil, errors.New("tls: invalid key")
+					}
 				}
 
 				var err error
@@ -148,10 +167,66 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 				if err != nil {
 					return nil, nil, nil, err
 				}
-
 				pdkKEMTLS = true
 				ciphertextKEMTLS = ct
 			}
+			if c.config.HybridIBEKEMTLSEnabled {
+				var encapsulator combiner.HybridKEM
+				var ct []byte
+				x509Cert, err := x509.ParseCertificate(certMsg.certificate.Certificate[0])
+				if err != nil {
+					return nil, nil, nil, errors.New("tls: invalid key")
+				}
+				pkECDSA, ok := x509Cert.PublicKey.(*ecdsa.PublicKey)
+				if !ok {
+					c.sendAlert(alertInternalError)
+					return nil, nil, nil, errors.New("crypto/tls: client found public key of wrong type")
+				}
+				combiner := new(xormac.Combiner)
+				scheme, err := combiner.NewScheme(new(ec.Scheme), new(dlp.Scheme))
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return nil, nil, nil, errors.New("crypto/tls: client couldn't generate hybrid scheme")
+				}
+				encapsulator, err = scheme.Encapsulator(c.config.Mpk, elliptic.Marshal(elliptic.P256(), pkECDSA.X, pkECDSA.Y))
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return nil, nil, nil, errors.New("crypto/tls: client couldn't generate hybrid encapsulator")
+				}
+				ct, sharedSecret, err = encapsulator.Encaps(c.config.ServerName)
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return nil, nil, nil, errors.New("crypto/tls: client couldn't encapsulate with hybrid KEM")
+				}
+				pdkKEMTLS = true
+				ciphertextKEMTLS = ct
+			}
+
+		} else {
+			certMsg := new(certificateMsgTLS13)
+			data := append([]byte(nil), config.CachedCert...)
+
+			if !certMsg.unmarshal(data) {
+				return nil, nil, nil, errors.New("tls: wrong cached certificates message")
+			}
+
+			if len(certMsg.certificate.Certificate) == 0 {
+				c.sendAlert(alertDecodeError)
+				return nil, nil, nil, errors.New("tls: wrong cached certificates message")
+			}
+
+			c.scts = certMsg.certificate.SignedCertificateTimestamps
+			c.ocspResponse = certMsg.certificate.OCSPStaple
+
+			// The following check will be performed in (hs *clientHandshakeStateTLS13) readServerCertificate()
+
+			// if err := c.verifyServerCertificate(certMsg.certificate.Certificate); err != nil {
+			// 	return nil, nil, nil, err
+			// }
+
+			// if !isPQTLSAuthUsed(c.peerCertificates[0], certMsg.certificate) {
+			// 	return nil, nil, nil, errors.New("tls: unexpected algorithm")
+			// }
 		}
 	}
 
@@ -222,11 +297,10 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 	var params ecdheParameters
 	var keyShares []keyShare
 	var keySharePrivates []clientKeySharePrivate
-
 	if hello.supportedVersions[0] == VersionTLS13 {
 		hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13()...)
-
-		if !config.KEMTLSEnabled && !config.PQTLSEnabled {
+		// LabSEC: Added 'config.HybridIBEKEMTLSEnabled'
+		if !config.KEMTLSEnabled && !config.PQTLSEnabled && !config.HybridIBEKEMTLSEnabled {
 			curveID := config.curvePreferences()[0]
 			if _, ok := curveForCurveID(curveID); curveID != X25519 && !ok {
 				return nil, nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
@@ -238,9 +312,9 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 			keyShares = append(keyShares, keyShare{group: curveID, data: params.PublicKey()})
 			keySharePrivates = append(keySharePrivates, params)
 			// TODO: add EXP name
-		} else if config.KEMTLSEnabled || config.PQTLSEnabled {
+			// LabSEC: Added 'config.HybridIBEKEMTLSEnabled'
+		} else if config.KEMTLSEnabled || config.PQTLSEnabled || config.HybridIBEKEMTLSEnabled {
 			var haveECDHE, haveKEM bool
-
 			// loop over supported curves and kems until there is a KEM and an ECDHE curve
 			for _, curveID := range config.curvePreferences() {
 				if _, ok := curveForCurveID(curveID); curveID != X25519 && !curveID.isKEM() && !ok {
@@ -262,7 +336,6 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 					if err != nil {
 						return nil, nil, nil, err
 					}
-
 					keyShares = append(keyShares, keyShare{group: curveID, data: pk.PublicKey})
 					keySharePrivates = append(keySharePrivates, sk)
 					haveKEM = true
@@ -282,12 +355,13 @@ func (c *Conn) makeClientHello(minVersion uint16) (*clientHelloMsg, []clientKeyS
 	return hello, keySharePrivates, sharedSecret, nil
 }
 
+// clientHandshake initializes the TLS handshake in the client side.
 func (c *Conn) clientHandshake() (err error) {
 	if c.config == nil {
 		c.config = defaultConfig()
 	}
-
 	handshakeTimings := createTLS13ClientHandshakeTimingInfo(c.config.Time)
+	c.clientHandshakeSizes = TLS13ClientHandshakeSizes{}
 
 	// This may be a renegotiation handshake, in which case some fields
 	// need to be reset.
@@ -300,23 +374,20 @@ func (c *Conn) clientHandshake() (err error) {
 		// then the ClientHelloInner must not offer TLS 1.2 or below.
 		minVersion = VersionTLS13
 	}
-
 	helloBase, keysharePrivates, ssKEMTLS, err := c.makeClientHello(minVersion)
 	if err != nil {
 		return err
 	}
-
 	hello, helloInner, err := c.echOfferOrGrease(helloBase)
 	if err != nil {
 		return err
 	}
-
 	helloResumed := hello
 	if c.ech.offered {
 		helloResumed = helloInner
 	}
-
 	cacheKey, session, earlySecret, binderKey := c.loadSession(helloResumed)
+
 	if cacheKey != "" && session != nil {
 		defer func() {
 			// If we got a handshake failure when resuming a session, throw away
@@ -334,14 +405,11 @@ func (c *Conn) clientHandshake() (err error) {
 	if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
 		return err
 	}
-
 	handshakeTimings.WriteClientHello = handshakeTimings.elapsedTime()
-
 	msg, err := c.readHandshake()
 	if err != nil {
 		return err
 	}
-
 	serverHello, ok := msg.(*serverHelloMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
@@ -1022,6 +1090,7 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 			DNSName:       dnsName,
 			Intermediates: x509.NewCertPool(),
 		}
+
 		for _, cert := range certs[1:] {
 			opts.Intermediates.AddCert(cert)
 		}
@@ -1034,7 +1103,7 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	}
 
 	switch certs[0].PublicKey.(type) {
-	case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey, circlSign.PublicKey, *kem.PublicKey:
+	case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey, circlSign.PublicKey, *kem.PublicKey, *liboqs_sig.PublicKey:
 		break
 	default:
 		c.sendAlert(alertUnsupportedCertificate)

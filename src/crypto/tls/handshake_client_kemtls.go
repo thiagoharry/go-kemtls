@@ -5,15 +5,25 @@
 package tls
 
 import (
+	//"circl/hpke"
+	//circlkem "circl/kem"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/kem"
 	"errors"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner/xorMac"
+	dlp "gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/idkem/dlp2"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/kem/ec"
 	"sync/atomic"
+	// Secret Print
+	//"fmt"
 )
 
 func (hs *clientHandshakeStateTLS13) handshakeKEMTLS() error {
 	c := hs.c
-
 	if hs.pdkKEMTLS {
 		if err := hs.processKEMTLSServerFinished(); err != nil {
 			return err
@@ -25,8 +35,17 @@ func (hs *clientHandshakeStateTLS13) handshakeKEMTLS() error {
 		if _, err := c.flush(); err != nil {
 			return err
 		}
+
+		// This expression is the same from hs.handshakeTimings.finish() method
+		hs.handshakeTimings.SendAppData = hs.handshakeTimings.timer().Sub(hs.handshakeTimings.total)
+
 		hs.handshakeTimings.reset()
 	} else {
+		if c.config.MpkExtension {
+			if err := hs.readServerIBEExtension(); err != nil {
+				return err
+			}
+		}
 		if err := hs.sendClientKEMCiphertext(); err != nil {
 			return err
 		}
@@ -43,7 +62,6 @@ func (hs *clientHandshakeStateTLS13) handshakeKEMTLS() error {
 			// second round for KEMTLS
 			hs.handshakeTimings.reset()
 		}
-
 		if err := hs.readServerKEMCiphertext(); err != nil {
 			return err
 		}
@@ -52,10 +70,12 @@ func (hs *clientHandshakeStateTLS13) handshakeKEMTLS() error {
 			return err
 		}
 
+		// This expression is the same from hs.handshakeTimings.finish() method
+		hs.handshakeTimings.SendAppData = hs.handshakeTimings.timer().Sub(hs.handshakeTimings.total)
 		if _, err := c.flush(); err != nil {
 			return err
 		}
-		// thrid round for KEMTLS
+		// third round for KEMTLS
 		hs.handshakeTimings.reset()
 		if err := hs.processKEMTLSServerFinished(); err != nil {
 			return err
@@ -66,7 +86,6 @@ func (hs *clientHandshakeStateTLS13) handshakeKEMTLS() error {
 	hs.handshakeTimings.finish()
 	c.handleCFEvent(hs.handshakeTimings)
 	atomic.StoreUint32(&c.handshakeStatus, 1)
-
 	return nil
 }
 
@@ -75,7 +94,9 @@ func (hs *clientHandshakeStateTLS13) sendClientKEMCiphertext() error {
 	var pk *kem.PublicKey
 	var ok bool
 	var ahs []byte
-
+	var encapsulator combiner.HybridKEM
+	var ss, ct []byte
+	var err error
 	if !(hs.pdkKEMTLS && hs.keyKEMShare) {
 		if c.verifiedDC != nil && c.verifiedDC.cred.expCertVerfAlgo.isKEMTLS() {
 			pk, ok = c.verifiedDC.cred.publicKey.(*kem.PublicKey)
@@ -83,33 +104,74 @@ func (hs *clientHandshakeStateTLS13) sendClientKEMCiphertext() error {
 				c.sendAlert(alertInternalError)
 				return errors.New("tls: invalid key")
 			}
+			ss, ct, err = kem.Encapsulate(hs.c.config.rand(), pk)
+			if err != nil {
+				return err
+			}
 		} else {
-			pk, ok = c.peerCertificates[0].PublicKey.(*kem.PublicKey)
-			if !ok {
-				c.sendAlert(alertInternalError)
-				return errors.New("tls: invalid key")
+			// HybridIBE
+			if c.config.HybridIBEKEMTLSEnabled {
+				pkECDSA, ok := c.peerCertificates[0].PublicKey.(*ecdsa.PublicKey)
+				if !ok {
+					c.sendAlert(alertInternalError)
+					return errors.New("crypto/tls: client found public key of wrong type")
+				}
+
+				combiner := new(xormac.Combiner)
+				scheme, err := combiner.NewScheme(new(ec.Scheme), new(dlp.Scheme))
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return errors.New("crypto/tls: client couldn't generate hybrid scheme")
+				}
+				encapsulator, err = scheme.Encapsulator(c.config.Mpk, elliptic.Marshal(elliptic.P256(), pkECDSA.X, pkECDSA.Y))
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return errors.New("crypto/tls: client couldn't generate hybrid encapsulator")
+				}
+				ct, ss, err = encapsulator.Encaps(c.config.ServerName)
+				if err != nil {
+					c.sendAlert(alertInternalError)
+					return errors.New("crypto/tls: client couldn't encapsulate with hybrid KEM")
+				}
+			} else {
+				pk, ok = c.peerCertificates[0].PublicKey.(*kem.PublicKey)
+				if !ok {
+					c.sendAlert(alertInternalError)
+					return errors.New("tls: invalid key")
+				}
+				ss, ct, err = kem.Encapsulate(hs.c.config.rand(), pk)
+				if err != nil {
+					return err
+				}
+
 			}
 		}
-
-		ss, ct, err := kem.Encapsulate(hs.c.config.rand(), pk)
-		if err != nil {
-			return err
-		}
+		// Secret Print
+		//fmt.Printf("Server Auth (client side)\nKEMId: %x\nsharedKey:\n  %x\n\n", pk.KEMId, ss)
 
 		msg := clientKeyExchangeMsg{
 			ciphertext: ct,
 		}
 
-		_, err = c.writeRecord(recordTypeHandshake, msg.marshal())
+		marshalledcKEMCt := msg.marshal()
+
+		_, err = c.writeRecord(recordTypeHandshake, marshalledcKEMCt)
 		if err != nil {
 			return err
 		}
 
-		_, err = hs.transcript.Write(msg.marshal())
+		_, err = hs.transcript.Write(marshalledcKEMCt)
 		if err != nil {
 			return err
 		}
 		hs.handshakeTimings.WriteKEMCiphertext = hs.handshakeTimings.elapsedTime()
+
+		clientKEMCtSize, err := getMessageLength(marshalledcKEMCt)
+		if err != nil {
+			return err
+		}
+
+		hs.c.clientHandshakeSizes.ClientKEMCiphertext = clientKEMCtSize
 
 		// AHS <- HKDF.Extract(dHS, ss_s)
 		ahs = hs.suite.extract(ss, hs.suite.deriveSecret(hs.handshakeSecret, "derived", nil))
@@ -129,7 +191,7 @@ func (hs *clientHandshakeStateTLS13) sendClientKEMCiphertext() error {
 	// dAHS  <- HKDF.Expand(AHS, "derived", nil)
 	hs.handshakeSecret = hs.suite.deriveSecret(ahs, "derived", nil)
 
-	err := c.config.writeKeyLog(keyLogLabelClientKEMAuthenticatedHandshake, hs.hello.random, clientSecret)
+	err = c.config.writeKeyLog(keyLogLabelClientKEMAuthenticatedHandshake, hs.hello.random, clientSecret)
 	if err != nil {
 		c.sendAlert(alertInternalError)
 		return err
@@ -197,12 +259,50 @@ func (hs *clientHandshakeStateTLS13) sendKEMClientCertificate() error {
 	certMsg.ocspStapling = hs.certReq.ocspStapling && len(cert.OCSPStaple) > 0
 	certMsg.delegatedCredential = hs.certReq.supportDelegatedCredential && len(cert.DelegatedCredential) > 0
 
-	hs.transcript.Write(certMsg.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, certMsg.marshal()); err != nil {
+	marshalledCertificate := certMsg.marshal()
+
+	hs.transcript.Write(marshalledCertificate)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledCertificate); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteCertificate = hs.handshakeTimings.elapsedTime()
+
+	certificateSize, err := getMessageLength(marshalledCertificate)
+	if err != nil {
+		return err
+	}
+
+	hs.c.clientHandshakeSizes.Certificate = certificateSize
+
+	return nil
+}
+
+func (hs *clientHandshakeStateTLS13) readServerIBEExtension() error {
+	c := hs.c
+
+	pkECDSA, ok := c.peerCertificates[0].PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		c.sendAlert(alertInternalError)
+		return errors.New("crypto/tls: client found public key of wrong type")
+	}
+	msg, err := c.readHandshake()
+	if err != nil {
+		return err
+	}
+	ibeMsg, ok := msg.(*serverIBEExtensionMsg)
+	if !ok {
+		c.sendAlert(alertUnexpectedMessage)
+		return unexpectedMessageError(ibeMsg, msg)
+	}
+	hs.transcript.Write(ibeMsg.marshal())
+	hash := crypto.SHA256.New()
+	hash.Write(c.config.Mpk)
+	digest := hash.Sum(nil)
+	if !ecdsa.VerifyASN1(pkECDSA, digest, ibeMsg.signature) {
+		c.sendAlert(alertInternalError)
+		return errors.New("crypto/tls: failed to verify IBEExtension")
+	}
 
 	return nil
 }
@@ -248,6 +348,9 @@ func (hs *clientHandshakeStateTLS13) readServerKEMCiphertext() error {
 		return err
 	}
 
+	// Secret Print
+	// fmt.Printf("Client Auth (client side)\nKEMId: %x\nsharedKey:\n  %x\n\n", sk.KEMId, ss)
+
 	// compute MS
 	// MS <- HKDF.Extract(dAHS, ssC)
 	hs.masterSecret = hs.suite.extract(ss, hs.handshakeSecret)
@@ -269,14 +372,23 @@ func (hs *clientHandshakeStateTLS13) sendKEMTLSClientFinished() error {
 		verifyData: hs.suite.finishedHashKEMTLS(hs.masterSecret, "c", hs.transcript),
 	}
 
-	if _, err := hs.transcript.Write(finished.marshal()); err != nil {
+	marshalledFinished := finished.marshal()
+
+	if _, err := hs.transcript.Write(marshalledFinished); err != nil {
 		return err
 	}
-	if _, err := c.writeRecord(recordTypeHandshake, finished.marshal()); err != nil {
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledFinished); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteClientFinished = hs.handshakeTimings.elapsedTime()
+
+	finishedSize, err1 := getMessageLength(marshalledFinished)
+	if err1 != nil {
+		return err1
+	}
+
+	hs.c.clientHandshakeSizes.Finished = finishedSize
 
 	// CATS <- HKDF.Expand(MS, "c ap traffic", CH..CF)
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,

@@ -12,12 +12,14 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/kem"
+	"crypto/liboqs_sig"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha512"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/cryptobyte"
 	"internal/cpu"
 	"io"
 	"net"
@@ -60,23 +62,25 @@ const (
 
 // TLS handshake message types.
 const (
-	typeHelloRequest        uint8 = 0
-	typeClientHello         uint8 = 1
-	typeServerHello         uint8 = 2
-	typeNewSessionTicket    uint8 = 4
-	typeEndOfEarlyData      uint8 = 5
-	typeEncryptedExtensions uint8 = 8
-	typeCertificate         uint8 = 11
-	typeServerKeyExchange   uint8 = 12
-	typeCertificateRequest  uint8 = 13
-	typeServerHelloDone     uint8 = 14
-	typeCertificateVerify   uint8 = 15
-	typeClientKeyExchange   uint8 = 16
-	typeFinished            uint8 = 20
-	typeCertificateStatus   uint8 = 22
-	typeKeyUpdate           uint8 = 24
-	typeNextProtocol        uint8 = 67  // Not IANA assigned
-	typeMessageHash         uint8 = 254 // synthetic message
+	typeHelloRequest          uint8 = 0
+	typeClientHello           uint8 = 1
+	typeServerHello           uint8 = 2
+	typeNewSessionTicket      uint8 = 4
+	typeEndOfEarlyData        uint8 = 5
+	typeEncryptedExtensions   uint8 = 8
+	typeCertificate           uint8 = 11
+	typeServerKeyExchange     uint8 = 12
+	typeCertificateRequest    uint8 = 13
+	typeServerHelloDone       uint8 = 14
+	typeCertificateVerify     uint8 = 15
+	typeClientKeyExchange     uint8 = 16
+	typeCertificateCachedInfo uint8 = 17 // Unassigned number. https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-7
+	typeFinished              uint8 = 20
+	typeCertificateStatus     uint8 = 22
+	typeKeyUpdate             uint8 = 24
+	typeIBEExtension          uint8 = 50
+	typeNextProtocol          uint8 = 67  // Not IANA assigned
+	typeMessageHash           uint8 = 254 // synthetic message
 )
 
 // TLS compression types.
@@ -130,11 +134,74 @@ const (
 	X25519    CurveID = 29
 	SIKEp434  CurveID = CurveID(kem.SIKEp434)
 	Kyber512  CurveID = CurveID(kem.Kyber512)
+	// Liboqs Hybrids
+	P256_Kyber512  CurveID = CurveID(kem.P256_Kyber512)
+	P384_Kyber768  CurveID = CurveID(kem.P384_Kyber768)
+	P521_Kyber1024 CurveID = CurveID(kem.P521_Kyber1024)
+
+	P256_LightSaber_KEM CurveID = CurveID(kem.P256_LightSaber_KEM)
+	P384_Saber_KEM      CurveID = CurveID(kem.P384_Saber_KEM)
+	P521_FireSaber_KEM  CurveID = CurveID(kem.P521_FireSaber_KEM)
+
+	P256_NTRU_HPS_2048_509 CurveID = CurveID(kem.P256_NTRU_HPS_2048_509)
+	P384_NTRU_HPS_2048_677 CurveID = CurveID(kem.P384_NTRU_HPS_2048_677)
+	P521_NTRU_HPS_4096_821 CurveID = CurveID(kem.P521_NTRU_HPS_4096_821)
+
+	P521_NTRU_HPS_4096_1229 CurveID = CurveID(kem.P521_NTRU_HPS_4096_1229)
+
+	P384_NTRU_HRSS_701  CurveID = CurveID(kem.P384_NTRU_HRSS_701)
+	P521_NTRU_HRSS_1373 CurveID = CurveID(kem.P521_NTRU_HPS_4096_821)
+
+	// Liboqs PQC
+	OQS_Kyber512  CurveID = CurveID(kem.OQS_Kyber512)
+	OQS_Kyber768  CurveID = CurveID(kem.OQS_Kyber768)
+	OQS_Kyber1024 CurveID = CurveID(kem.OQS_Kyber1024)
+
+	LightSaber_KEM CurveID = CurveID(kem.LightSaber_KEM)
+	Saber_KEM      CurveID = CurveID(kem.LightSaber_KEM)
+	FireSaber_KEM  CurveID = CurveID(kem.FireSaber_KEM)
+
+	NTRU_HPS_2048_509 CurveID = CurveID(kem.NTRU_HPS_2048_509)
+	NTRU_HPS_2048_677 CurveID = CurveID(kem.NTRU_HPS_2048_677)
+	NTRU_HPS_4096_821 CurveID = CurveID(kem.NTRU_HPS_4096_821)
+
+	NTRU_HPS_4096_1229 CurveID = CurveID(kem.NTRU_HPS_4096_1229)
+
+	NTRU_HRSS_701  CurveID = CurveID(kem.NTRU_HRSS_701)
+	NTRU_HRSS_1373 CurveID = CurveID(kem.NTRU_HRSS_1373)
+
+	P256_Classic_McEliece_348864 CurveID = CurveID(kem.P256_Classic_McEliece_348864)
 )
+
+var StringToCurveIDMap = map[string]CurveID{
+	"P256": CurveP256, "P384": CurveP384, "P521": CurveP521,
+	"Kyber512": OQS_Kyber512, "P256_Kyber512": P256_Kyber512,
+	"Kyber768": OQS_Kyber768, "P384_Kyber768": P384_Kyber768,
+	"Kyber1024": OQS_Kyber1024, "P521_Kyber1024": P521_Kyber1024,
+	"LightSaber_KEM": LightSaber_KEM, "P256_LightSaber_KEM": P256_LightSaber_KEM,
+	"Saber_KEM": Saber_KEM, "P384_Saber_KEM": P384_Saber_KEM,
+	"FireSaber_KEM": FireSaber_KEM, "P521_FireSaber_KEM": P521_FireSaber_KEM,
+	"NTRU_HPS_2048_509": NTRU_HPS_2048_509, "P256_NTRU_HPS_2048_509": P256_NTRU_HPS_2048_509,
+	"NTRU_HPS_2048_677": NTRU_HPS_2048_677, "P384_NTRU_HPS_2048_677": P384_NTRU_HPS_2048_677,
+	"NTRU_HPS_4096_821": NTRU_HPS_4096_821, "P521_NTRU_HPS_4096_821": P521_NTRU_HPS_4096_821,
+	"NTRU_HPS_4096_1229": NTRU_HPS_4096_1229, "P521_NTRU_HPS_4096_1229": P521_NTRU_HPS_4096_1229,
+	"NTRU_HRSS_701": NTRU_HRSS_701, "P384_NTRU_HRSS_701": P384_NTRU_HRSS_701,
+	"NTRU_HRSS_1373": NTRU_HRSS_1373, "P521_NTRU_HRSS_1373": P521_NTRU_HRSS_1373,
+	"P256_Classic-McEliece-348864": P256_Classic_McEliece_348864,
+}
+
+func CurveIDToString(curve CurveID) string {
+	for key, value := range StringToCurveIDMap {
+		if value == curve {
+			return key
+		}
+	}
+	return ""
+}
 
 func (curve CurveID) isKEM() bool {
 	switch curve {
-	case SIKEp434, Kyber512:
+	case SIKEp434, Kyber512, CurveID(kem.IsLiboqs(kem.ID(curve))):
 		return true
 	}
 	return false
@@ -187,6 +254,7 @@ const (
 	signatureEdDilithium3
 	signatureEdDilithium4
 	authKEMTLS // for the KEMTLS
+	authPQTLSLiboqs
 )
 
 // directSigning is a standard Hash value that signals that no pre-hashing
@@ -211,6 +279,18 @@ var supportedSignatureAlgorithms = []SignatureScheme{
 	ECDSAWithP521AndSHA512,
 	PKCS1WithSHA1,
 	ECDSAWithSHA1,
+	// Liboqs Hybrids
+	KEMTLSWithP256_Kyber512, KEMTLSWithP384_Kyber768, KEMTLSWithP521_Kyber1024, KEMTLSWithP256_LightSaber_KEM, KEMTLSWithP384_Saber_KEM, KEMTLSWithP521_FireSaber_KEM,
+	KEMTLSWithP256_NTRU_HPS_2048_509, KEMTLSWithP384_NTRU_HPS_2048_677, KEMTLSWithP521_NTRU_HPS_4096_821, KEMTLSWithP521_NTRU_HPS_4096_1229,
+	KEMTLSWithP384_NTRU_HRSS_701, KEMTLSWithP521_NTRU_HRSS_1373, KEMTLSWithP256_Classic_McEliece_348864,
+
+	// Liboqs PQC
+	KEMTLSWithOQS_Kyber512, KEMTLSWithOQS_Kyber768, KEMTLSWithOQS_Kyber1024, KEMTLSWithLightSaber_KEM, KEMTLSWithSaber_KEM, KEMTLSWithFireSaber_KEM,
+	KEMTLSWithNTRU_HPS_2048_509, KEMTLSWithNTRU_HPS_2048_677, KEMTLSWithNTRU_HPS_4096_821, KEMTLSWithNTRU_HPS_4096_1229, KEMTLSWithNTRU_HRSS_701, KEMTLSWithNTRU_HRSS_1373,
+
+	// Liboqs Signature
+	PQTLS_P256_Dilithium2, PQTLS_P256_Falcon512, PQTLS_P256_Sphincshake128ssimple, PQTLS_P384_Dilithium3, PQTLS_P384_RainbowIIIClassic, PQTLS_P521_Dilithium5, PQTLS_P521_Falcon1024, PQTLS_P521_Sphincshake256ssimple,
+	PQTLS_Dilithium2, PQTLS_Falcon512, PQTLS_Falcon1024, PQTLS_Dilithium3, PQTLS_Dilithium5, PQTLS_P521_Dilithium5, PQTLS_P521_Falcon1024, PQTLS_sphincsshake128ssimple, PQTLS_sphincsshake256ssimple,
 }
 
 // supportedSignatureAlgorithmsDC contains the signature and hash algorithms that
@@ -232,6 +312,15 @@ var supportedSignatureAlgorithmsDC = []SignatureScheme{
 	// Credentials.
 	PQTLSWithDilithium3,
 	PQTLSWithDilithium4,
+
+	// Liboqs Hybrids
+	KEMTLSWithP256_Kyber512, KEMTLSWithP384_Kyber768, KEMTLSWithP521_Kyber1024, KEMTLSWithP256_LightSaber_KEM, KEMTLSWithP384_Saber_KEM, KEMTLSWithP521_FireSaber_KEM,
+	KEMTLSWithP256_NTRU_HPS_2048_509, KEMTLSWithP384_NTRU_HPS_2048_677, KEMTLSWithP521_NTRU_HPS_4096_821, KEMTLSWithP521_NTRU_HPS_4096_1229,
+	KEMTLSWithP384_NTRU_HRSS_701, KEMTLSWithP521_NTRU_HRSS_1373, KEMTLSWithP256_Classic_McEliece_348864,
+
+	// Liboqs PQC
+	KEMTLSWithOQS_Kyber512, KEMTLSWithOQS_Kyber768, KEMTLSWithOQS_Kyber1024, KEMTLSWithLightSaber_KEM, KEMTLSWithSaber_KEM, KEMTLSWithFireSaber_KEM,
+	KEMTLSWithNTRU_HPS_2048_509, KEMTLSWithNTRU_HPS_2048_677, KEMTLSWithNTRU_HPS_4096_821, KEMTLSWithNTRU_HPS_4096_1229, KEMTLSWithNTRU_HRSS_701, KEMTLSWithNTRU_HRSS_1373,
 }
 
 // helloRetryRequestRandom is set as the Random value of a ServerHello
@@ -394,6 +483,9 @@ type ConnectionState struct {
 
 	// ekm is a closure exposed via ExportKeyingMaterial.
 	ekm func(label string, context []byte, length int) ([]byte, error)
+
+	ClientHandshakeSizes TLS13ClientHandshakeSizes
+	ServerHandshakeSizes TLS13ServerHandshakeSizes
 }
 
 // ExportKeyingMaterial returns length bytes of exported key material in a new
@@ -519,11 +611,169 @@ const (
 	// NOTE: Do not use outside of the experiment.
 	PQTLSWithDilithium3 SignatureScheme = 0xfe61
 	PQTLSWithDilithium4 SignatureScheme = 0xfe62
+
+	// Liboqs Hybrids
+	KEMTLSWithP256_Kyber512           SignatureScheme = 0xfe6b
+	KEMTLSWithP384_Kyber768           SignatureScheme = 0xfe6c
+	KEMTLSWithP521_Kyber1024          SignatureScheme = 0xfe6d
+	KEMTLSWithP256_LightSaber_KEM     SignatureScheme = 0xfe6e
+	KEMTLSWithP384_Saber_KEM          SignatureScheme = 0xfe6f
+	KEMTLSWithP521_FireSaber_KEM      SignatureScheme = 0xfe70
+	KEMTLSWithP256_NTRU_HPS_2048_509  SignatureScheme = 0xfe71
+	KEMTLSWithP384_NTRU_HPS_2048_677  SignatureScheme = 0xfe72
+	KEMTLSWithP521_NTRU_HPS_4096_821  SignatureScheme = 0xfe73
+	KEMTLSWithP521_NTRU_HPS_4096_1229 SignatureScheme = 0xfe74
+	KEMTLSWithP384_NTRU_HRSS_701      SignatureScheme = 0xfe75
+	KEMTLSWithP521_NTRU_HRSS_1373     SignatureScheme = 0xfe76
+
+	// Liboqs PQC
+	KEMTLSWithOQS_Kyber512       SignatureScheme = 0xfe6c
+	KEMTLSWithOQS_Kyber768       SignatureScheme = 0xfe6d
+	KEMTLSWithOQS_Kyber1024      SignatureScheme = 0xfe6e
+	KEMTLSWithLightSaber_KEM     SignatureScheme = 0xfe6f
+	KEMTLSWithSaber_KEM          SignatureScheme = 0xfe70
+	KEMTLSWithFireSaber_KEM      SignatureScheme = 0xfe71
+	KEMTLSWithNTRU_HPS_2048_509  SignatureScheme = 0xfe72
+	KEMTLSWithNTRU_HPS_2048_677  SignatureScheme = 0xfe73
+	KEMTLSWithNTRU_HPS_4096_821  SignatureScheme = 0xfe74
+	KEMTLSWithNTRU_HPS_4096_1229 SignatureScheme = 0xfe75
+	KEMTLSWithNTRU_HRSS_701      SignatureScheme = 0xfe76
+	KEMTLSWithNTRU_HRSS_1373     SignatureScheme = 0xfe77
+
+	// Liboqs Hybrid Signatures
+	PQTLS_P256_Dilithium2            SignatureScheme = 0xfe78
+	PQTLS_P256_Falcon512             SignatureScheme = 0xfe79
+	PQTLS_P256_Sphincshake128ssimple SignatureScheme = 0xfe7a
+	PQTLS_P384_Dilithium3            SignatureScheme = 0xfe7b
+	PQTLS_P384_RainbowIIIClassic     SignatureScheme = 0xfe7c
+	PQTLS_P521_Dilithium5            SignatureScheme = 0xfe7d
+	PQTLS_P521_Falcon1024            SignatureScheme = 0xfe7e
+	PQTLS_P521_Sphincshake256ssimple SignatureScheme = 0xfe7f
+
+	KEMTLSWithP256_Classic_McEliece_348864 SignatureScheme = 0xfe80
+
+	// Liboqs PQ-Only Signatures
+	PQTLS_Dilithium2 SignatureScheme = 0xfe81
+	PQTLS_Falcon512  SignatureScheme = 0xfe82
+
+	PQTLS_Dilithium3 SignatureScheme = 0xfe83
+
+	PQTLS_Dilithium5 SignatureScheme = 0xfe84
+	PQTLS_Falcon1024 SignatureScheme = 0xfe85
+
+	PQTLS_sphincsshake128ssimple SignatureScheme = 0xfe86
+	PQTLS_sphincsshake256ssimple SignatureScheme = 0xfe87
 )
+
+// Liboqs Hybrids
+
+// Hybrid KEMTLS Authentication
+var liboqsSignatureSchemeMap = map[kem.ID]SignatureScheme{
+	kem.P256_Kyber512: KEMTLSWithP256_Kyber512, kem.P384_Kyber768: KEMTLSWithP384_Kyber768, kem.P521_Kyber1024: KEMTLSWithP521_Kyber1024,
+	kem.P256_LightSaber_KEM: KEMTLSWithP256_LightSaber_KEM, kem.P384_Saber_KEM: KEMTLSWithP384_Saber_KEM, kem.P521_FireSaber_KEM: KEMTLSWithP521_FireSaber_KEM,
+	kem.P256_NTRU_HPS_2048_509: KEMTLSWithP256_NTRU_HPS_2048_509, kem.P384_NTRU_HPS_2048_677: KEMTLSWithP384_NTRU_HPS_2048_677, kem.P521_NTRU_HPS_4096_821: KEMTLSWithP521_NTRU_HPS_4096_821, kem.P521_NTRU_HPS_4096_1229: KEMTLSWithP521_NTRU_HPS_4096_1229,
+	kem.P384_NTRU_HRSS_701: KEMTLSWithP384_NTRU_HRSS_701, kem.P521_NTRU_HRSS_1373: KEMTLSWithP521_NTRU_HRSS_1373, kem.P256_Classic_McEliece_348864: KEMTLSWithP256_Classic_McEliece_348864,
+	kem.OQS_Kyber512: KEMTLSWithOQS_Kyber512, kem.OQS_Kyber768: KEMTLSWithOQS_Kyber768, kem.OQS_Kyber1024: KEMTLSWithOQS_Kyber1024,
+	kem.LightSaber_KEM: KEMTLSWithLightSaber_KEM, kem.Saber_KEM: KEMTLSWithSaber_KEM, kem.FireSaber_KEM: KEMTLSWithFireSaber_KEM,
+	kem.NTRU_HPS_2048_509: KEMTLSWithNTRU_HPS_2048_509, kem.NTRU_HPS_2048_677: KEMTLSWithNTRU_HPS_2048_677, kem.NTRU_HPS_4096_821: KEMTLSWithNTRU_HPS_4096_821,
+	kem.NTRU_HPS_4096_1229: KEMTLSWithNTRU_HPS_4096_1229, kem.NTRU_HRSS_701: KEMTLSWithNTRU_HRSS_701, kem.NTRU_HRSS_1373: KEMTLSWithNTRU_HRSS_1373,
+}
+
+var hybridLiboqsSignatureStringSchemeMap = map[SignatureScheme]string{
+	KEMTLSWithP256_Kyber512: "KEMTLSWithP256_Kyber512", KEMTLSWithP384_Kyber768: "KEMTLSWithP384_Kyber768", KEMTLSWithP521_Kyber1024: "KEMTLSWithP521_Kyber1024",
+	KEMTLSWithP256_LightSaber_KEM:          "KEMTLSWithP256_LightSaber_KEM",
+	KEMTLSWithP384_Saber_KEM:               "KEMTLSWithP384_Saber_KEM",
+	KEMTLSWithP521_FireSaber_KEM:           "KEMTLSWithP521_FireSaber_KEM",
+	KEMTLSWithP256_NTRU_HPS_2048_509:       "KEMTLSWithP256_NTRU_HPS_2048_509",
+	KEMTLSWithP384_NTRU_HPS_2048_677:       "KEMTLSWithP384_NTRU_HPS_2048_677",
+	KEMTLSWithP521_NTRU_HPS_4096_821:       "KEMTLSWithP521_NTRU_HPS_4096_821",
+	KEMTLSWithP521_NTRU_HPS_4096_1229:      "KEMTLSWithP521_NTRU_HPS_4096_1229",
+	KEMTLSWithP384_NTRU_HRSS_701:           "KEMTLSWithP384_NTRU_HRSS_701",
+	KEMTLSWithP521_NTRU_HRSS_1373:          "KEMTLSWithP521_NTRU_HRSS_1373",
+	KEMTLSWithP256_Classic_McEliece_348864: "KEMTLSWithP256_Classic_McEliece_348864",
+}
+
+var liboqsSignatureStringSchemeMap = map[SignatureScheme]string{
+	KEMTLSWithOQS_Kyber512:       "KEMTLSWithOQS_Kyber512",
+	KEMTLSWithOQS_Kyber768:       "KEMTLSWithOQS_Kyber768",
+	KEMTLSWithOQS_Kyber1024:      "KEMTLSWithOQS_Kyber1024",
+	KEMTLSWithLightSaber_KEM:     "KEMTLSWithLightSaber_KEM",
+	KEMTLSWithSaber_KEM:          "KEMTLSWithSaber_KEM",
+	KEMTLSWithFireSaber_KEM:      "KEMTLSWithFireSaber_KEM",
+	KEMTLSWithNTRU_HPS_2048_509:  "KEMTLSWithNTRU_HPS_2048_509",
+	KEMTLSWithNTRU_HPS_2048_677:  "KEMTLSWithNTRU_HPS_2048_677",
+	KEMTLSWithNTRU_HPS_4096_821:  "KEMTLSWithNTRU_HPS_4096_821",
+	KEMTLSWithNTRU_HPS_4096_1229: "KEMTLSWithNTRU_HPS_4096_1229",
+	KEMTLSWithNTRU_HRSS_701:      "KEMTLSWithNTRU_HRSS_701",
+	KEMTLSWithNTRU_HRSS_1373:     "KEMTLSWithNTRU_HRSS_1373",
+}
+
+func StringKEM(scheme SignatureScheme) string {
+	return hybridLiboqsSignatureStringSchemeMap[scheme]
+}
+
+func isLiboqsKEMSignature(scheme SignatureScheme) SignatureScheme {
+	if scheme >= KEMTLSWithP256_Kyber512 && scheme <= KEMTLSWithNTRU_HRSS_1373 {
+		return scheme
+	}
+	return 0
+}
+
+func liboqsKEMFromSignature(scheme SignatureScheme) kem.ID {
+	for key, value := range liboqsSignatureSchemeMap {
+		if value == scheme {
+			return key
+		}
+	}
+	return 0
+}
+
+// Hybrid PQTLS Authentication
+
+var liboqsSigSignatureSchemeMap = map[liboqs_sig.ID]SignatureScheme{
+	liboqs_sig.P256_Dilithium2: PQTLS_P256_Dilithium2, liboqs_sig.P256_Falcon512: PQTLS_P256_Falcon512, liboqs_sig.P256_SphincsShake128sSimple: PQTLS_P256_Sphincshake128ssimple,
+	liboqs_sig.P384_Dilithium3: PQTLS_P384_Dilithium3, liboqs_sig.P384_RainbowIIIClassic: PQTLS_P384_RainbowIIIClassic,
+	liboqs_sig.P521_Dilithium5: PQTLS_P521_Dilithium5, liboqs_sig.P521_Falcon1024: PQTLS_P521_Falcon1024, liboqs_sig.P521_SphincsShake256sSimple: PQTLS_P521_Sphincshake256ssimple,
+
+	liboqs_sig.Dilithium2: PQTLS_Dilithium2, liboqs_sig.Falcon512: PQTLS_Falcon512,
+	liboqs_sig.Dilithium3: PQTLS_Dilithium3,
+	liboqs_sig.Dilithium5: PQTLS_Dilithium5, liboqs_sig.Falcon1024: PQTLS_Falcon1024,
+	liboqs_sig.SphincsShake128sSimple: PQTLS_sphincsshake128ssimple,
+	liboqs_sig.SphincsShake256sSimple: PQTLS_sphincsshake256ssimple,
+}
+
+func isLiboqsSigSignature(scheme SignatureScheme) SignatureScheme {
+	if scheme >= PQTLS_P256_Dilithium2 && scheme <= PQTLS_sphincsshake256ssimple {
+		return scheme
+	}
+	return 0
+}
+
+func classicFromHybridSig(scheme SignatureScheme) SignatureScheme {
+	switch true {
+	case scheme >= PQTLS_P256_Dilithium2 && scheme <= PQTLS_P256_Sphincshake128ssimple:
+		return ECDSAWithP256AndSHA256
+	case scheme >= PQTLS_P384_Dilithium3 && scheme <= PQTLS_P384_RainbowIIIClassic:
+		return ECDSAWithP384AndSHA384
+	case scheme >= PQTLS_P521_Dilithium5 && scheme <= PQTLS_P521_Sphincshake256ssimple:
+		return ECDSAWithP521AndSHA512
+	default:
+		return 0
+	}
+}
 
 func (scheme SignatureScheme) isKEMTLS() bool {
 	switch scheme {
-	case KEMTLSWithSIKEp434, KEMTLSWithKyber512:
+	case KEMTLSWithSIKEp434, KEMTLSWithKyber512, isLiboqsKEMSignature(scheme):
+		return true
+	default:
+		return false
+	}
+}
+
+func (scheme SignatureScheme) isHybridIBEKEMTLS() bool {
+	switch scheme {
+	case ECDSAWithP256AndSHA256:
 		return true
 	default:
 		return false
@@ -532,7 +782,7 @@ func (scheme SignatureScheme) isKEMTLS() bool {
 
 func (scheme SignatureScheme) isPQTLS() bool {
 	switch scheme {
-	case PQTLSWithDilithium3, PQTLSWithDilithium4:
+	case PQTLSWithDilithium3, PQTLSWithDilithium4, isLiboqsSigSignature(scheme):
 		return true
 	default:
 		return false
@@ -912,6 +1162,14 @@ type Config struct {
 	// authentication based on TLS 1.3.
 	PQTLSEnabled bool
 
+	// HybridIBEKEMTLSEnabled is true if the client or server is willing
+	// to start a IBE-Hybrid-KEMTLS handshake based on TLS 1.3. In the case
+	// of a server, it also need to have a skID
+	HybridIBEKEMTLSEnabled bool
+	SkID                   []byte
+	Mpk                    []byte
+	MpkExtension           bool
+
 	// CachedCert corresponds to a cached server's Certificate message by the
 	// client. If filled, it will be used by the cached information extension.
 	CachedCert []byte
@@ -930,6 +1188,10 @@ type Config struct {
 	// autoSessionTicketKeys is like sessionTicketKeys but is owned by the
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
+
+	// OCSPResponseFilePath is the path to the file where the OCSP Response made by the ACME server was written to. If this string is not empty,
+	// the file will be read and the OCSP Response from it will be sent through OCSP stapling in the handshake.
+	OCSPResponseFilePath string
 }
 
 const (
@@ -1011,6 +1273,9 @@ func (c *Config) Clone() *Config {
 		SupportDelegatedCredential:  c.SupportDelegatedCredential,
 		KEMTLSEnabled:               c.KEMTLSEnabled,
 		PQTLSEnabled:                c.PQTLSEnabled,
+		HybridIBEKEMTLSEnabled:      c.HybridIBEKEMTLSEnabled,
+		SkID:                        c.SkID,
+		Mpk:                         c.Mpk,
 		CachedCert:                  c.CachedCert,
 		CachedCertReq:               c.CachedCertReq,
 		ECHEnabled:                  c.ECHEnabled,
@@ -1020,6 +1285,7 @@ func (c *Config) Clone() *Config {
 		CFControl:                   c.CFControl,
 		sessionTicketKeys:           c.sessionTicketKeys,
 		autoSessionTicketKeys:       c.autoSessionTicketKeys,
+		OCSPResponseFilePath:        c.OCSPResponseFilePath,
 	}
 }
 
@@ -1849,4 +2115,100 @@ func deprioritizeAES(ciphers []uint16) []uint16 {
 		return nonAESGCMAEADCiphers[reordered[i]] && aesgcmCiphers[reordered[j]]
 	})
 	return reordered
+}
+
+// getMessageLength returns the handshake message length
+func getMessageLength(msg []byte) (uint32, error) {
+	var msg_size uint32
+
+	s := cryptobyte.String(msg)
+	if !s.Skip(1) || !s.ReadUint24(&msg_size) {
+		return 0, errors.New("tls: couldn't get length of client hello message")
+	}
+
+	return msg_size, nil
+}
+
+// Performs the Test connections in the server side or the client side
+func testConnHybrid(clientMsg, serverMsg string, tlsConfig *Config, peer string, ipserver string, port string) (timingState timingInfo, cconnState ConnectionState, err error, success bool) {
+	tlsConfig.CFEventHandler = timingState.eventHandler
+
+	handshakeSizes := make(map[string]uint32)
+
+	var timingsFullProtocol float64
+	var timingsWriteServerHello float64
+	var timingsReadKEMCiphertext float64
+
+	buf := make([]byte, len(clientMsg))
+
+	countConnections := 0
+
+	ln, err := net.Listen("tcp", ipserver+":"+port)
+	if err != nil {
+		ln, err = net.Listen("tcp6", "[::1]:0")
+	}
+	if err != nil {
+		//log.Fatal(err)
+	}
+	defer ln.Close()
+
+	ignoreFirstConn := false
+
+	for {
+
+		serverConn, err := ln.Accept()
+		if err != nil {
+			fmt.Print(err)
+			fmt.Printf("error 1 %v", err)
+		}
+		server := Server(serverConn, tlsConfig)
+		if err := server.Handshake(); err != nil {
+			fmt.Printf("Handshake error %v", err)
+		}
+
+		//server read client hello
+		n, err := server.Read(buf)
+		if err != nil || n != len(clientMsg) {
+			fmt.Print(err)
+			fmt.Printf("error 2 %v", err)
+		}
+
+		//server responds
+		n, err = server.Write([]byte(serverMsg))
+		if n != len(serverMsg) || err != nil {
+			//error
+			fmt.Print(err)
+			fmt.Printf("error 3 %v", err)
+		}
+
+		if ignoreFirstConn {
+			ignoreFirstConn = false
+			continue
+		}
+
+		countConnections++
+
+		cconnState = server.ConnectionState()
+
+		if cconnState.DidKEMTLS {
+
+			timingsFullProtocol = float64(timingState.serverTimingInfo.FullProtocol) / float64(time.Millisecond)
+			timingsWriteServerHello = float64(timingState.serverTimingInfo.WriteServerHello) / float64(time.Millisecond)
+			timingsReadKEMCiphertext = float64(timingState.serverTimingInfo.ReadKEMCiphertext) / float64(time.Millisecond)
+
+			handshakeSizes["ServerHello"] = cconnState.ServerHandshakeSizes.ServerHello
+			handshakeSizes["EncryptedExtensions"] = cconnState.ServerHandshakeSizes.EncryptedExtensions
+			handshakeSizes["Certificate"] = cconnState.ServerHandshakeSizes.Certificate
+			handshakeSizes["CertificateRequest"] = cconnState.ServerHandshakeSizes.CertificateRequest
+			handshakeSizes["ServerKEMCiphertext"] = cconnState.ServerHandshakeSizes.ServerKEMCiphertext
+			handshakeSizes["Finished"] = cconnState.ServerHandshakeSizes.Finished
+
+			kemtlsSaveCSVServer("Remote IBE-KEM 384", timingsFullProtocol, timingsWriteServerHello, timingsReadKEMCiphertext, handshakeSizes)
+			countConnections = 0
+			timingsFullProtocol = 0.0
+			timingsReadKEMCiphertext = 0.0
+			timingsWriteServerHello = 0.0
+		}
+
+	}
 }

@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/curve25519"
+
+	"github.com/open-quantum-safe/liboqs-go/oqs"
 )
 
 // ID identifies each type of KEM.
@@ -21,6 +23,43 @@ const (
 	Kyber512 ID = 0x01fc
 	// SIKEp434 is a post-quantum KEM, as defined in: https://sike.org/ .
 	SIKEp434 ID = 0x01fd
+	// Liboqs Hybrids
+	P256_Kyber512  ID = 0x0204
+	P384_Kyber768  ID = 0x0205
+	P521_Kyber1024 ID = 0x0206
+
+	P256_LightSaber_KEM ID = 0x0207
+	P384_Saber_KEM      ID = 0x0208
+	P521_FireSaber_KEM  ID = 0x0209
+
+	P256_NTRU_HPS_2048_509 ID = 0x020a
+	P384_NTRU_HPS_2048_677 ID = 0x020b
+	P521_NTRU_HPS_4096_821 ID = 0x020c
+
+	P521_NTRU_HPS_4096_1229 ID = 0x020d
+
+	P384_NTRU_HRSS_701  ID = 0x020e
+	P521_NTRU_HRSS_1373 ID = 0x020f
+
+	// Liboqs PQC
+	OQS_Kyber512  ID = 0x0210
+	OQS_Kyber768  ID = 0x0211
+	OQS_Kyber1024 ID = 0x0212
+
+	LightSaber_KEM ID = 0x0213
+	Saber_KEM      ID = 0x0214
+	FireSaber_KEM  ID = 0x0215
+
+	NTRU_HPS_2048_509 ID = 0x0216
+	NTRU_HPS_2048_677 ID = 0x0217
+	NTRU_HPS_4096_821 ID = 0x0218
+
+	NTRU_HPS_4096_1229 ID = 0x0219
+
+	NTRU_HRSS_701  ID = 0x021a
+	NTRU_HRSS_1373 ID = 0x021b
+
+	P256_Classic_McEliece_348864 ID = 0x021c
 )
 
 // PrivateKey is a KEM private key.
@@ -98,6 +137,32 @@ func GenerateKey(rand io.Reader, kemID ID) (*PublicKey, *PrivateKey, error) {
 		publicKey.Export(pubBytes)
 		privateKey.Export(privBytes)
 		return &PublicKey{KEMId: kemID, PublicKey: pubBytes}, &PrivateKey{KEMId: kemID, PrivateKey: privBytes}, nil
+	case IsLiboqs(kemID):
+
+		var pubBytes, privBytes []byte
+		var err error
+
+		if isPQCLiboqs(kemID) {
+			oqsKEM := oqs.KeyEncapsulation{}
+
+			if err := oqsKEM.Init(liboqsPQCKEMString[kemID], nil); err != nil {
+				return nil, nil, err
+			}
+			pubBytes, err = oqsKEM.GenerateKeyPair()
+			if err != nil {
+				return nil, nil, err
+			}
+			privBytes = oqsKEM.ExportSecretKey()
+		} else {
+			scheme := liboqsSchemeMap[kemID]
+
+			pubBytes, privBytes, err = scheme.Keygen()
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return &PublicKey{KEMId: kemID, PublicKey: pubBytes}, &PrivateKey{KEMId: kemID, PrivateKey: privBytes}, nil
+
 	default:
 		return nil, nil, fmt.Errorf("crypto/kem: internal error: unsupported KEM %d", kemID)
 	}
@@ -152,6 +217,33 @@ func Encapsulate(rand io.Reader, pk *PublicKey) (sharedSecret []byte, ciphertext
 			return nil, nil, err
 		}
 		return ss, ct, nil
+	case IsLiboqs(pk.KEMId):
+
+		var ss, ct []byte
+		var err error
+
+		if isPQCLiboqs(pk.KEMId) {
+			oqsKEM := oqs.KeyEncapsulation{}
+
+			if err := oqsKEM.Init(liboqsPQCKEMString[pk.KEMId], nil); err != nil {
+				return nil, nil, err
+			}
+
+			ct, ss, err = oqsKEM.EncapSecret(pk.PublicKey)
+			if err != nil {
+				return nil, nil, err
+			}
+
+		} else {
+			scheme := liboqsSchemeMap[pk.KEMId]
+
+			ct, ss, err = scheme.Encapsulate(pk)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		return ss, ct, nil
 	default:
 		return nil, nil, errors.New("crypto/kem: internal error: unsupported KEM in Encapsulate")
 	}
@@ -197,7 +289,37 @@ func Decapsulate(privateKey *PrivateKey, ciphertext []byte) (sharedSecret []byte
 		}
 
 		return ss, nil
+	case IsLiboqs(privateKey.KEMId):
+		var ss []byte
+		var err error
+
+		if isPQCLiboqs(privateKey.KEMId) {
+			oqsKEM := oqs.KeyEncapsulation{}
+
+			if err := oqsKEM.Init(liboqsPQCKEMString[privateKey.KEMId], privateKey.PrivateKey); err != nil {
+				return nil, err
+			}
+
+			ss, err = oqsKEM.DecapSecret(ciphertext)
+			if err != nil {
+				return nil, err
+			}
+
+		} else {
+			scheme := liboqsSchemeMap[privateKey.KEMId]
+
+			ss, err = scheme.Decapsulate(privateKey, ciphertext)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return ss, nil
 	default:
 		return nil, errors.New("crypto/kem: internal error: unsupported KEM in Decapsulate")
 	}
+}
+
+func SchemeFromID(id ID) string {
+	return liboqsPQCKEMString[id]
 }

@@ -620,6 +620,7 @@ func (test *serverTest) loadData() (flows [][]byte, err error) {
 }
 
 func (test *serverTest) run(t *testing.T, write bool) {
+	//t.Skip("XXX")
 	var clientConn, serverConn net.Conn
 	var recordingConn *recordingConn
 	var childProcess *exec.Cmd

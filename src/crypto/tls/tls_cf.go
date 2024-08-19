@@ -118,7 +118,22 @@ type CFEventTLS13ClientHandshakeTimingInfo struct {
 	ReadKEMCiphertext  time.Duration
 	FullProtocol       time.Duration
 
+	SendAppData time.Duration
+
 	ExperimentName string
+}
+
+type TLS13ClientHandshakeSizes struct {
+	// KEMTLS/PQTLS Mutual
+	ClientHello uint32
+	Certificate uint32
+	Finished    uint32
+
+	// PQTLS exclusive
+	CertificateVerify uint32
+
+	// KEMTLS exclusive
+	ClientKEMCiphertext uint32
 }
 
 // Name is required by the CFEvent interface.
@@ -179,6 +194,21 @@ type CFEventTLS13ServerHandshakeTimingInfo struct {
 	FullProtocol       time.Duration
 
 	ExperimentName string
+}
+
+type TLS13ServerHandshakeSizes struct {
+	// KEMTLS/PQTLS Mutual
+	ServerHello         uint32
+	EncryptedExtensions uint32
+	Certificate         uint32
+	CertificateRequest  uint32
+	Finished            uint32
+
+	// KEMTLS exclusive
+	ServerKEMCiphertext uint32
+
+	// PQTLS exclusive
+	CertificateVerify uint32
 }
 
 // Name is required by the CFEvent interface.

@@ -14,6 +14,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/kem"
+	"crypto/liboqs_sig"
 	"crypto/rsa"
 	"errors"
 	"fmt"
@@ -58,6 +59,21 @@ func verifyHandshakeSignature(sigType uint8, pubkey crypto.PublicKey, hashFunc c
 		if err := rsa.VerifyPSS(pubKey, hashFunc, signed, sig, signOpts); err != nil {
 			return err
 		}
+	case authPQTLSLiboqs:
+		pubKey, ok := pubkey.(*liboqs_sig.PublicKey)
+		if !ok {
+			return fmt.Errorf("expected a Liboqs Signature public key, got %T", pubkey)
+		}
+
+		valid, err := pubKey.Verify(signed, sig)
+		if err != nil {
+			return err
+		}
+
+		if !valid {
+			return fmt.Errorf("Verification failure")
+		}
+
 	default:
 		scheme := circlSchemeBySigType(sigType)
 		if scheme == nil {
@@ -127,6 +143,12 @@ func typeAndHashFromSignatureScheme(signatureAlgorithm SignatureScheme) (sigType
 		sigType = signatureEdDilithium3
 	case PQTLSWithDilithium4:
 		sigType = signatureEdDilithium4
+	case isLiboqsKEMSignature(signatureAlgorithm):
+		sigType = authKEMTLS
+	case isLiboqsSigSignature(signatureAlgorithm):
+		sigType = authPQTLSLiboqs
+	case KEMTLSWithP256_Classic_McEliece_348864:
+		sigType = authKEMTLS
 	default:
 		scheme := circlPki.SchemeByTLSID(uint(signatureAlgorithm))
 		if scheme == nil {
@@ -151,8 +173,22 @@ func typeAndHashFromSignatureScheme(signatureAlgorithm SignatureScheme) (sigType
 		hash = directSigning
 	case KEMTLSWithSIKEp434, KEMTLSWithKyber512:
 		hash = directSigning
-	case PQTLSWithDilithium3, PQTLSWithDilithium4:
+	case PQTLSWithDilithium3, PQTLSWithDilithium4, KEMTLSWithP256_Classic_McEliece_348864:
 		hash = directSigning
+	case isLiboqsKEMSignature(signatureAlgorithm):
+		hash = directSigning
+	case isLiboqsSigSignature(signatureAlgorithm):
+		classicSig := classicFromHybridSig(signatureAlgorithm)
+		switch classicSig {
+		case ECDSAWithP256AndSHA256:
+			hash = crypto.SHA256
+		case ECDSAWithP384AndSHA384:
+			hash = crypto.SHA384
+		case ECDSAWithP521AndSHA512:
+			hash = crypto.SHA512
+		default:
+			hash = directSigning // Just for completeness
+		}
 	default:
 		scheme := circlPki.SchemeByTLSID(uint(signatureAlgorithm))
 		if scheme == nil {
@@ -210,54 +246,69 @@ var rsaSignatureSchemes = []struct {
 //
 // This function must be kept in sync with supportedSignatureAlgorithms.
 func signatureSchemesForCertificate(version uint16, cert *Certificate) []SignatureScheme {
-	priv, ok := cert.PrivateKey.(crypto.Signer)
-	if !ok {
-		return nil
-	}
 
 	var sigAlgs []SignatureScheme
-	switch pub := priv.Public().(type) {
-	case *ecdsa.PublicKey:
-		if version != VersionTLS13 {
-			// In TLS 1.2 and earlier, ECDSA algorithms are not
-			// constrained to a single curve.
-			sigAlgs = []SignatureScheme{
-				ECDSAWithP256AndSHA256,
-				ECDSAWithP384AndSHA384,
-				ECDSAWithP521AndSHA512,
-				ECDSAWithSHA1,
-			}
-			break
-		}
-		switch pub.Curve {
-		case elliptic.P256():
-			sigAlgs = []SignatureScheme{ECDSAWithP256AndSHA256}
-		case elliptic.P384():
-			sigAlgs = []SignatureScheme{ECDSAWithP384AndSHA384}
-		case elliptic.P521():
-			sigAlgs = []SignatureScheme{ECDSAWithP521AndSHA512}
-		default:
-			return nil
-		}
-	case *rsa.PublicKey:
-		size := pub.Size()
-		sigAlgs = make([]SignatureScheme, 0, len(rsaSignatureSchemes))
-		for _, candidate := range rsaSignatureSchemes {
-			if size >= candidate.minModulusBytes && version <= candidate.maxVersion {
-				sigAlgs = append(sigAlgs, candidate.scheme)
-			}
-		}
-	case ed25519.PublicKey:
-		sigAlgs = []SignatureScheme{Ed25519}
-	case circlSign.PublicKey:
-		scheme := pub.Scheme()
-		tlsScheme, ok := scheme.(circlPki.TLSScheme)
+
+	_, ok := cert.PrivateKey.(*kem.PrivateKey)
+	if ok {
+		pk, ok := cert.Leaf.PublicKey.(*kem.PublicKey)
 		if !ok {
 			return nil
 		}
-		sigAlgs = []SignatureScheme{SignatureScheme(tlsScheme.TLSIdentifier())}
-	default:
-		return nil
+
+		sigAlgs = []SignatureScheme{liboqsSignatureSchemeMap[pk.KEMId]}
+
+	} else {
+		priv, ok := cert.PrivateKey.(crypto.Signer)
+		if !ok {
+			return nil
+		}
+
+		switch pub := priv.Public().(type) {
+		case *ecdsa.PublicKey:
+			if version != VersionTLS13 {
+				// In TLS 1.2 and earlier, ECDSA algorithms are not
+				// constrained to a single curve.
+				sigAlgs = []SignatureScheme{
+					ECDSAWithP256AndSHA256,
+					ECDSAWithP384AndSHA384,
+					ECDSAWithP521AndSHA512,
+					ECDSAWithSHA1,
+				}
+				break
+			}
+			switch pub.Curve {
+			case elliptic.P256():
+				sigAlgs = []SignatureScheme{ECDSAWithP256AndSHA256}
+			case elliptic.P384():
+				sigAlgs = []SignatureScheme{ECDSAWithP384AndSHA384}
+			case elliptic.P521():
+				sigAlgs = []SignatureScheme{ECDSAWithP521AndSHA512}
+			default:
+				return nil
+			}
+		case *rsa.PublicKey:
+			size := pub.Size()
+			sigAlgs = make([]SignatureScheme, 0, len(rsaSignatureSchemes))
+			for _, candidate := range rsaSignatureSchemes {
+				if size >= candidate.minModulusBytes && version <= candidate.maxVersion {
+					sigAlgs = append(sigAlgs, candidate.scheme)
+				}
+			}
+		case ed25519.PublicKey:
+			sigAlgs = []SignatureScheme{Ed25519}
+		case circlSign.PublicKey:
+			scheme := pub.Scheme()
+			tlsScheme, ok := scheme.(circlPki.TLSScheme)
+			if !ok {
+				return nil
+			}
+			sigAlgs = []SignatureScheme{SignatureScheme(tlsScheme.TLSIdentifier())}
+		case liboqs_sig.PublicKey:
+			sigAlgs = []SignatureScheme{liboqsSigSignatureSchemeMap[pub.SigId]}
+		default:
+			return nil
+		}
 	}
 
 	if cert.SupportedSignatureAlgorithms != nil {
@@ -293,6 +344,8 @@ func signatureSchemeForDelegatedCredential(version uint16, dc *DelegatedCredenti
 			sigAlgs = []SignatureScheme{KEMTLSWithSIKEp434}
 		case kem.Kyber512:
 			sigAlgs = []SignatureScheme{KEMTLSWithKyber512}
+		case kem.IsLiboqs(pk.KEMId):
+			sigAlgs = []SignatureScheme{liboqsSignatureSchemeMap[pk.KEMId]}
 		default:
 			return nil
 		}

@@ -7,11 +7,16 @@ package tls
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/kem"
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner/xorMac"
+	dlp "gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/idkem/dlp2"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/kem/ec"
 	"hash"
 	"io"
 	"sync/atomic"
@@ -30,9 +35,16 @@ type serverHandshakeStateTLS13 struct {
 	sentDummyCCS bool
 	usingPSK     bool
 
-	keyKEMShare        bool
-	isKEMTLS           bool
-	pdkKEMTLS          bool
+	usingCachedInformation bool   // RFC 7924: Cached Information Extension
+	certHash               []byte // RFC 7924: Cached Information Extension
+
+	keyKEMShare bool
+	isKEMTLS    bool
+	pdkKEMTLS   bool
+	// LabSEC: Added 'hybridIBEKEMTLS'
+	hybridIBEKEMTLS bool
+	skId            []byte
+
 	ssKEMTLS           []byte
 	isClientAuthKEMTLS bool
 
@@ -49,6 +61,9 @@ type serverHandshakeStateTLS13 struct {
 	certReq         *certificateRequestMsgTLS13
 
 	handshakeTimings CFEventTLS13ServerHandshakeTimingInfo
+
+	// ocspResponse is the dummy OCSP response created by the ACME server, which will be stapled in the handshake.
+	ocspResponse []byte
 }
 
 // processDelegatedCredentialFromClient unmarshals the DelegatedCredential
@@ -92,7 +107,6 @@ func (hs *serverHandshakeStateTLS13) processDelegatedCredentialFromClient(rawDC 
 
 func (hs *serverHandshakeStateTLS13) handshake() error {
 	c := hs.c
-
 	// For an overview of the TLS 1.3 handshake, see RFC 8446, Section 2.
 	if err := hs.processClientHello(); err != nil {
 		return err
@@ -100,6 +114,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.checkForResumption(); err != nil {
 		return err
 	}
+
 	if err := hs.pickCertificate(); err != nil {
 		return err
 	}
@@ -110,7 +125,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.sendServerCertificate(); err != nil {
 		return err
 	}
-	if hs.isKEMTLS {
+	if hs.isKEMTLS || hs.hybridIBEKEMTLS {
 		// send application data for KEMTLS
 		if !hs.pdkKEMTLS {
 			if _, err := c.flush(); err != nil {
@@ -119,7 +134,6 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 			// second round of sending for KEMTLS
 			hs.handshakeTimings.reset()
 		}
-
 		return hs.handshakeKEMTLS()
 	}
 	if err := hs.sendServerFinished(); err != nil {
@@ -145,7 +159,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	}
 
 	//hs.handshakeTimings.ExperimentName = experimentName(c)
-	fmt.Printf("\n %+v \n", hs.handshakeTimings)
+	// fmt.Printf("\n %+v \n", hs.handshakeTimings)
 	hs.handshakeTimings.finish()
 	c.handleCFEvent(hs.handshakeTimings)
 
@@ -156,7 +170,6 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 
 func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	c := hs.c
-
 	hs.hello = new(serverHelloMsg)
 
 	// TLS 1.3 froze the ServerHello.legacy_version field, and uses
@@ -168,7 +181,6 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: client used the legacy version field to negotiate TLS 1.3")
 	}
-
 	// Abort if the client is doing a fallback and landing lower than what we
 	// support. See RFC 7507, which however does not specify the interaction
 	// with supported_versions. The only difference is that with
@@ -189,40 +201,36 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 			break
 		}
 	}
-
 	if len(hs.clientHello.compressionMethods) != 1 ||
 		hs.clientHello.compressionMethods[0] != compressionNone {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: TLS 1.3 client supports illegal compression methods")
 	}
-
 	if hs.clientHello.cachedInformationCert {
+		// signature_algorithms is required in TLS 1.3. See RFC 8446, Section 4.2.3.
+		if len(hs.clientHello.supportedSignatureAlgorithms) == 0 {
+			return c.sendAlert(alertMissingExtension)
+		}
+
+		certificate, err := c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
+		if err != nil {
+			if err == errNoCertificates {
+				c.sendAlert(alertUnrecognizedName)
+			} else {
+				c.sendAlert(alertInternalError)
+			}
+			return err
+		}
+		hs.sigAlg, err = selectSignatureScheme(c.vers, certificate, hs.clientHello.supportedSignatureAlgorithms)
+		if err != nil {
+			// getCertificate returned a certificate that is unsupported or
+			// incompatible with the client's signature algorithms.
+			c.sendAlert(alertHandshakeFailure)
+			return err
+		}
+
+		hs.cert = certificate
 		if c.config.KEMTLSEnabled {
-			// signature_algorithms is required in TLS 1.3. See RFC 8446, Section 4.2.3.
-			if len(hs.clientHello.supportedSignatureAlgorithms) == 0 {
-				return c.sendAlert(alertMissingExtension)
-			}
-
-			certificate, err := c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
-			if err != nil {
-				if err == errNoCertificates {
-					c.sendAlert(alertUnrecognizedName)
-				} else {
-					c.sendAlert(alertInternalError)
-				}
-				return err
-			}
-
-			hs.sigAlg, err = selectSignatureScheme(c.vers, certificate, hs.clientHello.supportedSignatureAlgorithms)
-			if err != nil {
-				// getCertificate returned a certificate that is unsupported or
-				// incompatible with the client's signature algorithms.
-				c.sendAlert(alertHandshakeFailure)
-				return err
-			}
-
-			hs.cert = certificate
-
 			if hs.clientHello.delegatedCredentialSupported && len(hs.clientHello.supportedSignatureAlgorithmsDC) > 0 {
 				delegatedCredentialPair, err := getDelegatedCredential(clientHelloInfo(c, hs.clientHello), hs.cert)
 				if err != nil {
@@ -278,6 +286,85 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 						}
 					}
 				}
+			} else if c.config.HybridIBEKEMTLSEnabled {
+				var decapsulator combiner.HybridKEM
+				certMsg := new(certificateMsgTLS13)
+				certMsg.certificate = *hs.cert
+				certMsg.scts = hs.clientHello.scts && len(hs.cert.SignedCertificateTimestamps) > 0
+				certMsg.ocspStapling = hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0
+				certMsg.delegatedCredential = hs.clientHello.delegatedCredentialSupported && len(hs.cert.DelegatedCredential) > 0
+
+				certMsgRaw := certMsg.marshal()
+				cachedCertHash := calculateHashCachedInfo(certMsgRaw)
+				if bytes.Equal(cachedCertHash, hs.clientHello.cachedInformationCertHash) {
+					hs.hello.cachedInformationCert = true
+					skECDSA, ok := hs.cert.PrivateKey.(*ecdsa.PrivateKey)
+					if !ok {
+						c.sendAlert(alertInternalError)
+						return errors.New("crypto/tls: private key unexpectedly of wrong type")
+					}
+					combiner := new(xormac.Combiner)
+					scheme, err := combiner.NewScheme(new(ec.Scheme), new(dlp.Scheme))
+					if err != nil {
+						c.sendAlert(alertInternalError)
+						return errors.New("crypto/tls: couldn't generate hybrid scheme")
+					}
+					decapsulator, err = scheme.Decapsulator(skECDSA.D.Bytes(), c.config.SkID)
+					if err != nil {
+						c.sendAlert(alertInternalError)
+						return errors.New("crypto/tls: couldn't generate hybrid decapsulator")
+					}
+					ss, err := decapsulator.Decaps(c.config.ServerName, hs.clientHello.ciphertextKEMTLS)
+					if err != nil {
+						return err
+					}
+					hs.pdkKEMTLS = true
+					hs.ssKEMTLS = ss
+					hs.hello.pdkKEMTLS = true
+				}
+			} else {
+				certMsg := new(certificateMsgTLS13)
+				certMsg.certificate = *hs.cert
+				certMsg.scts = hs.clientHello.scts && len(hs.cert.SignedCertificateTimestamps) > 0
+				certMsg.ocspStapling = hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0
+				certMsg.delegatedCredential = hs.clientHello.delegatedCredentialSupported && len(hs.cert.DelegatedCredential) > 0
+
+				certMsgRaw := certMsg.marshal()
+				cachedCertHash := calculateHashCachedInfo(certMsgRaw)
+				if bytes.Equal(cachedCertHash, hs.clientHello.cachedInformationCertHash) {
+					hs.hello.cachedInformationCert = true
+
+					sk, ok1 := hs.cert.PrivateKey.(*kem.PrivateKey)
+					if !ok1 {
+						c.sendAlert(alertInternalError)
+						return errors.New("crypto/tls: private key unexpectedly of wrong type")
+					}
+
+					ss, err := kem.Decapsulate(sk, hs.clientHello.ciphertextKEMTLS)
+					if err != nil {
+						return err
+					}
+					hs.pdkKEMTLS = true
+					hs.ssKEMTLS = ss
+					hs.hello.pdkKEMTLS = true
+				}
+			}
+		} else {
+			certMsg := new(certificateMsgTLS13)
+
+			certMsg.certificate = *hs.cert
+			certMsg.scts = hs.clientHello.scts && len(hs.cert.SignedCertificateTimestamps) > 0
+			certMsg.ocspStapling = hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0
+			certMsg.delegatedCredential = hs.clientHello.delegatedCredentialSupported && len(hs.cert.DelegatedCredential) > 0
+
+			certMsgRaw := certMsg.marshal()
+			cachedCertHash := calculateHashCachedInfo(certMsgRaw)
+
+			if bytes.Equal(cachedCertHash, hs.clientHello.cachedInformationCertHash) {
+				hs.hello.cachedInformationCert = true
+				hs.certHash = cachedCertHash
+
+				hs.usingCachedInformation = true
 			}
 		}
 	}
@@ -301,7 +388,6 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		// hint.
 		copy(hs.hello.random[24:], []byte{0, 0, 0, 0, 0, 0, 0, 0})
 	}
-
 	if len(hs.clientHello.secureRenegotiation) != 0 {
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("tls: initial handshake had non-empty renegotiation extension")
@@ -320,7 +406,6 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 
 	hs.hello.sessionId = hs.clientHello.sessionId
 	hs.hello.compressionMethod = compressionNone
-
 	var preferenceList, supportedList []uint16
 	if c.config.PreferServerCipherSuites {
 		preferenceList = defaultCipherSuitesTLS13()
@@ -342,6 +427,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 			preferenceList = deprioritizeAES(preferenceList)
 		}
 	}
+
 	for _, suiteID := range preferenceList {
 		hs.suite = mutualCipherSuiteTLS13(supportedList, suiteID)
 		if hs.suite != nil {
@@ -420,8 +506,7 @@ GroupSelection:
 		}
 		clientKeyShare = &hs.clientHello.keyShares[0]
 	}
-
-	if selectedGroup.isKEM() && (c.config.KEMTLSEnabled || c.config.PQTLSEnabled) {
+	if selectedGroup.isKEM() && (c.config.KEMTLSEnabled || c.config.PQTLSEnabled || c.config.HybridIBEKEMTLSEnabled) {
 		sharedKey, ciphertext, err := kem.Encapsulate(c.config.rand(), &kem.PublicKey{KEMId: kem.ID(selectedGroup), PublicKey: clientKeyShare.data})
 		if err != nil {
 			c.sendAlert(alertInternalError)
@@ -430,6 +515,7 @@ GroupSelection:
 		hs.hello.serverShare = keyShare{group: selectedGroup, data: ciphertext}
 		hs.sharedKey = sharedKey
 		hs.keyKEMShare = true
+
 	} else {
 		if _, ok := curveForCurveID(selectedGroup); (selectedGroup != X25519 && !selectedGroup.isKEM()) && !ok {
 			c.sendAlert(alertInternalError)
@@ -448,11 +534,8 @@ GroupSelection:
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: invalid client key share")
 	}
-
 	c.serverName = hs.clientHello.serverName
-
 	hs.handshakeTimings.ProcessClientHello = hs.handshakeTimings.elapsedTime()
-
 	return nil
 }
 
@@ -611,9 +694,10 @@ func getDelegatedCredential(clientHello *ClientHelloInfo, cert *Certificate) (*D
 	return nil, errors.New("No valid Delegated Credential found.")
 }
 
+// pickCertificate selects the server's certificate to be used in the TLS handshake..
+// Additionally, the server will staple the dummy OCSP response generated by the ACME server.
 func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 	c := hs.c
-
 	// Only one of PSK and certificates are used at a time.
 	if hs.usingPSK {
 		return nil
@@ -623,12 +707,18 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 		return nil
 	}
 
+	if hs.usingCachedInformation {
+		c.didPQTLS = true
+		return nil
+	}
 	// signature_algorithms is required in TLS 1.3. See RFC 8446, Section 4.2.3.
 	if len(hs.clientHello.supportedSignatureAlgorithms) == 0 {
 		return c.sendAlert(alertMissingExtension)
 	}
 
-	certificate, err := c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
+	var certificate *Certificate
+	var err error
+	certificate, err = c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
 	if err != nil {
 		if err == errNoCertificates {
 			c.sendAlert(alertUnrecognizedName)
@@ -637,7 +727,6 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 		}
 		return err
 	}
-
 	hs.sigAlg, err = selectSignatureScheme(c.vers, certificate, hs.clientHello.supportedSignatureAlgorithms)
 	if err != nil {
 		// getCertificate returned a certificate that is unsupported or
@@ -645,7 +734,6 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 		c.sendAlert(alertHandshakeFailure)
 		return err
 	}
-
 	hs.cert = certificate
 
 	if hs.clientHello.delegatedCredentialSupported && len(hs.clientHello.supportedSignatureAlgorithmsDC) > 0 {
@@ -689,6 +777,11 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 				hs.isKEMTLS = true
 			} else if hs.sigAlg.isPQTLS() {
 				c.didPQTLS = true
+				// TODO:VVC: Understand why is not going to the above case
+			} else if hs.c.config.PQTLSEnabled {
+				c.didPQTLS = true
+			} else if c.config.SkID != nil {
+				hs.hybridIBEKEMTLS = true
 			} else {
 				c.sendAlert(alertHandshakeFailure)
 				return err
@@ -867,13 +960,22 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		hs.hello.raw = nil
 	}
 
+	marshalledServerHello := hs.hello.marshal()
+
 	hs.transcript.Write(hs.clientHello.marshal())
-	hs.transcript.Write(hs.hello.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, hs.hello.marshal()); err != nil {
+	hs.transcript.Write(marshalledServerHello)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledServerHello); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteServerHello = hs.handshakeTimings.elapsedTime()
+
+	serverHelloSize, err1 := getMessageLength(marshalledServerHello)
+	if err1 != nil {
+		return err1
+	}
+
+	hs.c.serverHandshakeSizes.ServerHello = serverHelloSize
 
 	if err := hs.sendDummyChangeCipherSpec(); err != nil {
 		return err
@@ -910,13 +1012,20 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		encryptedExtensions.ech = c.ech.retryConfigs
 	}
 
-	hs.transcript.Write(encryptedExtensions.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, encryptedExtensions.marshal()); err != nil {
+	marshalledEE := encryptedExtensions.marshal()
+
+	hs.transcript.Write(marshalledEE)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledEE); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteEncryptedExtensions = hs.handshakeTimings.elapsedTime()
 
+	eeSize, err := getMessageLength(marshalledEE)
+	if err != nil {
+		return err
+	}
+	hs.c.serverHandshakeSizes.EncryptedExtensions = eeSize
 	return nil
 }
 
@@ -936,6 +1045,11 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		hs.isKEMTLS = true
 		return nil
 	}
+	if c.config.HybridIBEKEMTLSEnabled {
+		hs.isKEMTLS = true
+		hs.hybridIBEKEMTLS = true
+		//return nil
+	}
 
 	if hs.requestClientCert() || hs.requestClientKEMCert() {
 		// Request a client certificate
@@ -950,12 +1064,21 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		}
 
 		hs.certReq = certReq
-		hs.transcript.Write(certReq.marshal())
-		if _, err := c.writeRecord(recordTypeHandshake, certReq.marshal()); err != nil {
+
+		marshalledCertReq := certReq.marshal()
+		hs.transcript.Write(marshalledCertReq)
+		if _, err := c.writeRecord(recordTypeHandshake, marshalledCertReq); err != nil {
 			return err
 		}
 
-		c.certificateReqMessage = certReq.marshal()
+		c.certificateReqMessage = marshalledCertReq
+
+		certReqSize, err := getMessageLength(marshalledCertReq)
+		if err != nil {
+			return err
+		}
+
+		hs.c.serverHandshakeSizes.CertificateRequest = certReqSize
 	}
 
 	certMsg := new(certificateMsgTLS13)
@@ -965,14 +1088,45 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 	certMsg.ocspStapling = hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0
 	certMsg.delegatedCredential = hs.clientHello.delegatedCredentialSupported && len(hs.cert.DelegatedCredential) > 0
 
-	hs.transcript.Write(certMsg.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, certMsg.marshal()); err != nil {
-		return err
-	}
 	c.certificateMessage = certMsg.marshal()
 
-	hs.handshakeTimings.WriteCertificate = hs.handshakeTimings.elapsedTime()
+	if hs.usingCachedInformation && hs.certHash != nil {
+		cachedCertMsg := new(certificateMsgTLS13CachedInfo)
+		cachedCertMsg.hash_value = hs.certHash
 
+		marshalledCachedCert := cachedCertMsg.marshal()
+
+		hs.transcript.Write(marshalledCachedCert)
+		if _, err := c.writeRecord(recordTypeHandshake, marshalledCachedCert); err != nil {
+			return err
+		}
+
+		hs.handshakeTimings.WriteCertificate = hs.handshakeTimings.elapsedTime()
+
+		cachedCertLength, err := getMessageLength(marshalledCachedCert)
+		if err != nil {
+			return err
+		}
+
+		hs.c.serverHandshakeSizes.Certificate = cachedCertLength
+	} else {
+
+		marshalledCertificate := certMsg.marshal()
+		hs.transcript.Write(marshalledCertificate)
+		//fmt.Printf("Sending certificate: %v\n", time.Now().UnixNano())
+		if _, err := c.writeRecord(recordTypeHandshake, marshalledCertificate); err != nil {
+			return err
+		}
+
+		hs.handshakeTimings.WriteCertificate = hs.handshakeTimings.elapsedTime()
+
+		certificateLength, err := getMessageLength(marshalledCertificate)
+		if err != nil {
+			return err
+		}
+
+		hs.c.serverHandshakeSizes.Certificate = certificateLength
+	}
 	if !hs.isKEMTLS {
 		certVerifyMsg := new(certificateVerifyMsg)
 		certVerifyMsg.hasSignatureAlgorithm = true
@@ -1019,19 +1173,28 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		}
 		certVerifyMsg.signature = sig
 
-		hs.transcript.Write(certVerifyMsg.marshal())
-		if _, err := c.writeRecord(recordTypeHandshake, certVerifyMsg.marshal()); err != nil {
+		marshalledCertVerify := certVerifyMsg.marshal()
+
+		hs.transcript.Write(marshalledCertVerify)
+		if _, err := c.writeRecord(recordTypeHandshake, marshalledCertVerify); err != nil {
 			return err
 		}
 
 		hs.handshakeTimings.WriteCertificateVerify = hs.handshakeTimings.elapsedTime()
+
+		certVerifyLength, err := getMessageLength(marshalledCertVerify)
+		if err != nil {
+			return err
+		}
+
+		hs.c.serverHandshakeSizes.CertificateVerify = certVerifyLength
 	} else {
 		hs.handshakeTimings.WriteCertificateVerify = hs.handshakeTimings.elapsedTime()
 	}
-
 	return nil
 }
 
+// sendServerFinished
 func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	c := hs.c
 
@@ -1043,12 +1206,21 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 		verifyData: hs.suite.finishedHash(c.out.trafficSecret, hs.transcript),
 	}
 
-	hs.transcript.Write(finished.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, finished.marshal()); err != nil {
+	marshalledFinished := finished.marshal()
+
+	hs.transcript.Write(marshalledFinished)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledFinished); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteServerFinished = hs.handshakeTimings.elapsedTime()
+
+	finishedSize, err1 := getMessageLength(marshalledFinished)
+	if err1 != nil {
+		return err1
+	}
+
+	hs.c.serverHandshakeSizes.Finished = finishedSize
 
 	// Derive secrets that take context through the server Finished.
 
@@ -1263,13 +1435,11 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	if err != nil {
 		return err
 	}
-
 	finished, ok := msg.(*finishedMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
 		return unexpectedMessageError(finished, msg)
 	}
-
 	if !hmac.Equal(hs.clientFinished, finished.verifyData) {
 		c.sendAlert(alertDecryptError)
 		return errors.New("tls: invalid client finished hash")

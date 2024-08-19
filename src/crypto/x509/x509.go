@@ -38,6 +38,8 @@ import (
 	circlPki "circl/pki"
 	circlSign "circl/sign"
 
+	"crypto/liboqs_sig"
+
 	"golang.org/x/crypto/cryptobyte"
 	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
 )
@@ -72,6 +74,10 @@ func ParsePKIXPublicKey(derBytes []byte) (pub interface{}, err error) {
 		return nil, errors.New("x509: unknown public key algorithm")
 	}
 	return parsePublicKey(algo, &pki)
+}
+
+func MarshalPublicKey(pub interface{}) (publicKeyBytes []byte, publicKeyAlgorithm pkix.AlgorithmIdentifier, err error) {
+	return marshalPublicKey(pub)
 }
 
 func marshalPublicKey(pub interface{}) (publicKeyBytes []byte, publicKeyAlgorithm pkix.AlgorithmIdentifier, err error) {
@@ -115,6 +121,12 @@ func marshalPublicKey(pub interface{}) (publicKeyBytes []byte, publicKeyAlgorith
 	case *kem.PublicKey:
 		publicKeyBytes, _ = pub.MarshalBinary()
 		publicKeyAlgorithm.Algorithm = oidPublicKeyKEMTLS
+	case *liboqs_sig.PublicKey:
+		publicKeyBytes = pub.MarshalBinary()
+		publicKeyAlgorithm.Algorithm = oidPublicKeyPQTLS
+	case liboqs_sig.PublicKey:
+		publicKeyBytes = pub.MarshalBinary()
+		publicKeyAlgorithm.Algorithm = oidPublicKeyPQTLS
 	default:
 		return nil, pkix.AlgorithmIdentifier{}, fmt.Errorf("x509: unsupported public key type: %T", pub)
 	}
@@ -217,6 +229,21 @@ const (
 	PureEd448
 	PureEdDilithium3
 	PureEdDilithium4
+	P256Dilithium2
+	P256Falcon512
+	P256SphincsShake128sSimple
+	P384Dilithium3
+	P384RainbowIIIClassic
+	P521Dilithium5
+	P521Falcon1024
+	P521SphincsShake256sSimple
+	Dilithium2
+	Falcon512
+	SphincsShake128sSimple
+	Dilithium3
+	Dilithium5
+	Falcon1024
+	SphincsShake256sSimple
 )
 
 func (algo SignatureAlgorithm) isRSAPSS() bool {
@@ -249,6 +276,7 @@ const (
 	EdDilithium3
 	EdDilithium4
 	KEMTLS
+	PQTLS
 )
 
 var publicKeyAlgoName = [...]string{
@@ -260,6 +288,7 @@ var publicKeyAlgoName = [...]string{
 	EdDilithium3: "Ed25519-Dilithium3",
 	EdDilithium4: "Ed448-Dilithium4",
 	KEMTLS:       "KEMTLS",
+	PQTLS:        "PQTLS",
 }
 
 func (algo PublicKeyAlgorithm) String() string {
@@ -350,7 +379,36 @@ var (
 	// but it's specified by ISO. Microsoft's makecert.exe has been known
 	// to produce certificates with this OID.
 	oidISOSignatureSHA1WithRSA = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 29}
+
+	oidSignatureP256Dilithium2            = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 12}
+	oidSignatureP256Falcon512             = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 13}
+	oidSignatureP256Sphincshake128ssimple = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 14}
+	oidSignatureP384Dilithium3            = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 15}
+	oidSignatureP384RainbowIIIClassic     = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 16}
+	oidSignatureP521Dilithium5            = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 17}
+	oidSignatureP521Falcon1024            = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 18}
+	oidSignatureP521Sphincshake256ssimple = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 19}
+
+	oidSignatureDilithium2             = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 20}
+	oidSignatureFalcon512              = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 21}
+	oidSignatureDilithium3             = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 22}
+	oidSignatureDilithium5             = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 23}
+	oidSignatureFalcon1024             = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 24}
+	oidSignatureSphincsshake128ssimple = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 25}
+	oidSignatureSphincsshake256ssimple = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 26}
 )
+
+var oidSignatureFromSigID = map[liboqs_sig.ID]asn1.ObjectIdentifier{
+	liboqs_sig.P256_Dilithium2: oidSignatureP256Dilithium2, liboqs_sig.P256_Falcon512: oidSignatureP256Falcon512, liboqs_sig.P256_SphincsShake128sSimple: oidSignatureP256Sphincshake128ssimple,
+	liboqs_sig.P384_Dilithium3: oidSignatureP384Dilithium3, liboqs_sig.P384_RainbowIIIClassic: oidSignatureP384RainbowIIIClassic,
+	liboqs_sig.P521_Dilithium5: oidSignatureP521Dilithium5, liboqs_sig.P521_Falcon1024: oidSignatureP521Falcon1024, liboqs_sig.P521_SphincsShake256sSimple: oidSignatureP521Sphincshake256ssimple,
+
+	liboqs_sig.Dilithium2: oidSignatureDilithium2, liboqs_sig.Falcon512: oidSignatureFalcon512,
+	liboqs_sig.Dilithium3: oidSignatureDilithium3,
+	liboqs_sig.Dilithium5: oidSignatureDilithium5, liboqs_sig.Falcon1024: oidSignatureFalcon1024,
+	liboqs_sig.SphincsShake128sSimple: oidSignatureSphincsshake128ssimple,
+	liboqs_sig.SphincsShake256sSimple: oidSignatureSphincsshake256ssimple,
+}
 
 var signatureAlgorithmDetails = []struct {
 	algo       SignatureAlgorithm
@@ -376,6 +434,21 @@ var signatureAlgorithmDetails = []struct {
 	{ECDSAWithSHA384, "ECDSA-SHA384", oidSignatureECDSAWithSHA384, ECDSA, crypto.SHA384},
 	{ECDSAWithSHA512, "ECDSA-SHA512", oidSignatureECDSAWithSHA512, ECDSA, crypto.SHA512},
 	{PureEd25519, "Ed25519", oidSignatureEd25519, Ed25519, crypto.Hash(0) /* no pre-hashing */},
+	{P256Dilithium2, "P256Dilithium2", oidSignatureP256Dilithium2, PQTLS, crypto.SHA256},
+	{P256Falcon512, "P256Falcon512", oidSignatureP256Falcon512, PQTLS, crypto.SHA256},
+	{P256SphincsShake128sSimple, "P256Sphincsshake128ssimple", oidSignatureP256Sphincshake128ssimple, PQTLS, crypto.SHA256},
+	{P384Dilithium3, "P384Dilithium3", oidSignatureP384Dilithium3, PQTLS, crypto.SHA384},
+	{P384RainbowIIIClassic, "P384RainbowIIIClassic", oidSignatureP384RainbowIIIClassic, PQTLS, crypto.SHA384},
+	{P521Dilithium5, "P521Dilithium5", oidSignatureP521Dilithium5, PQTLS, crypto.SHA512},
+	{P521Falcon1024, "P521Falcon1024", oidSignatureP521Falcon1024, PQTLS, crypto.SHA512},
+	{P521SphincsShake256sSimple, "P521Sphincsshake256ssimple", oidSignatureP521Sphincshake256ssimple, PQTLS, crypto.SHA512},
+	{Dilithium2, "Dilithium2", oidSignatureDilithium2, PQTLS, crypto.Hash(0)},
+	{Falcon512, "Falcon512", oidSignatureFalcon512, PQTLS, crypto.Hash(0)},
+	{SphincsShake128sSimple, "Sphincsshake128ssimple", oidSignatureSphincsshake128ssimple, PQTLS, crypto.Hash(0)},
+	{SphincsShake256sSimple, "Sphincsshake256ssimple", oidSignatureSphincsshake256ssimple, PQTLS, crypto.Hash(0)},
+	{Dilithium3, "Dilithium3", oidSignatureDilithium3, PQTLS, crypto.Hash(0)},
+	{Dilithium5, "Dilithium5", oidSignatureDilithium5, PQTLS, crypto.Hash(0)},
+	{Falcon1024, "Falcon1024", oidSignatureFalcon1024, PQTLS, crypto.Hash(0)},
 }
 
 // hashToPSSParameters contains the DER encoded RSA PSS parameters for the
@@ -482,6 +555,7 @@ var (
 	oidPublicKeyEdDilithium3 = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 9}  // Cloudflare OID
 	oidPublicKeyEdDilithium4 = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 10} // Cloudflare OID
 	oidPublicKeyKEMTLS       = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 11} // Cloudflare OID
+	oidPublicKeyPQTLS        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 45, 12}
 )
 
 func getPublicKeyAlgorithmFromOID(oid asn1.ObjectIdentifier) PublicKeyAlgorithm {
@@ -502,6 +576,8 @@ func getPublicKeyAlgorithmFromOID(oid asn1.ObjectIdentifier) PublicKeyAlgorithm 
 		return EdDilithium4
 	case oid.Equal(oidPublicKeyKEMTLS):
 		return KEMTLS
+	case oid.Equal(oidPublicKeyPQTLS):
+		return PQTLS
 	default:
 		scheme := circlPki.SchemeByOid(oid)
 		if scheme == nil {
@@ -868,7 +944,7 @@ func checkSignature(algo SignatureAlgorithm, signed, signature []byte, publicKey
 
 	switch hashType {
 	case crypto.Hash(0):
-		if pubKeyAlgo != Ed25519 && CirclSchemeByPublicKeyAlgorithm(pubKeyAlgo) == nil {
+		if pubKeyAlgo != Ed25519 && CirclSchemeByPublicKeyAlgorithm(pubKeyAlgo) == nil && pubKeyAlgo != PQTLS {
 			return ErrUnsupportedAlgorithm
 		}
 	case crypto.MD5:
@@ -920,6 +996,29 @@ func checkSignature(algo SignatureAlgorithm, signed, signature []byte, publicKey
 		if !scheme.Verify(pub, signed, signature, nil) {
 			return fmt.Errorf("x509: %s verification failed", scheme.Name())
 		}
+		return
+	case liboqs_sig.PublicKey:
+		if pubKeyAlgo != PQTLS {
+			return signaturePublicKeyAlgoMismatchError(pubKeyAlgo, pub)
+		}
+
+		valid, _ := pub.Verify(signed, signature)
+		if !valid {
+			return errors.New("x509: PQTLS verification failure")
+		}
+
+		return
+
+	case *liboqs_sig.PublicKey:
+		if pubKeyAlgo != PQTLS {
+			return signaturePublicKeyAlgoMismatchError(pubKeyAlgo, pub)
+		}
+
+		valid, _ := pub.Verify(signed, signature)
+		if !valid {
+			return errors.New("x509: PQTLS verification failure")
+		}
+
 		return
 	}
 	return ErrUnsupportedAlgorithm
@@ -973,6 +1072,9 @@ type distributionPointName struct {
 	RelativeName pkix.RDNSequence `asn1:"optional,tag:1"`
 }
 
+func ParsePublicKey(algo PublicKeyAlgorithm, keyData *publicKeyInfo) (interface{}, error) {
+	return parsePublicKey(algo, keyData)
+}
 func parsePublicKey(algo PublicKeyAlgorithm, keyData *publicKeyInfo) (interface{}, error) {
 	asn1Data := keyData.PublicKey.RightAlign()
 	switch algo {
@@ -1075,6 +1177,13 @@ func parsePublicKey(algo PublicKeyAlgorithm, keyData *publicKeyInfo) (interface{
 		err := pub.UnmarshalBinary(keyData.PublicKey.Bytes)
 		if err != nil {
 			return nil, errors.New("x509: wrong KEM identifier")
+		}
+		return pub, nil
+	case PQTLS:
+		pub := new(liboqs_sig.PublicKey)
+		err := pub.UnmarshalBinary(keyData.PublicKey.Bytes)
+		if err != nil {
+			return nil, err
 		}
 		return pub, nil
 	default:
@@ -2083,6 +2192,23 @@ func marshalCertificatePolicies(policyIdentifiers []asn1.ObjectIdentifier) (pkix
 	return ext, nil
 }
 
+func marshalSCT(ti []TransItem) (pkix.Extension, error) {
+
+	ext := pkix.Extension{
+		Id:       asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2},
+		Critical: false,
+	}
+
+	var err error
+
+	ext.Value, err = asn1.Marshal(ti)
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+
+	return ext, nil
+}
+
 func buildCSRExtensions(template *CertificateRequest) ([]pkix.Extension, error) {
 	var ret []pkix.Extension
 
@@ -2156,6 +2282,15 @@ func signingParamsForPublicKey(pub interface{}, requestedSigAlgo SignatureAlgori
 			return
 		}
 		sigAlgo.Algorithm = certScheme.Oid()
+	case liboqs_sig.PublicKey:
+		pubType = PQTLS
+		sigAlgo.Algorithm = oidSignatureFromSigID[pub.SigId]
+		if liboqs_sig.IsSigHybrid(pub.SigId) {
+			hashFunc, err = liboqs_sig.HashFromSig(pub.SigId)
+			if err != nil {
+				return
+			}
+		}
 	default:
 		err = errors.New("x509: only RSA, ECDSA, Ed25519 and circl keys supported")
 	}
@@ -2978,4 +3113,186 @@ func CreateRevocationList(rand io.Reader, template *RevocationList, issuer *Cert
 		SignatureAlgorithm: signatureAlgorithm,
 		SignatureValue:     asn1.BitString{Bytes: signature, BitLength: len(signature) * 8},
 	})
+}
+
+// CTExtension is a Log Artifact extension from the Certificate Transparency version 2.0 (RFC 9162)
+// This extension is described in the section 4.6 and it is going to be used for SCTs.
+type CTExtension struct {
+	ExtensionType int
+	ExtensionData []byte
+}
+
+// VersionedTransType for X.509 SCT v2.
+const (
+	x509_sct_v2 int = 0x0102
+)
+
+// TransItem is the TransItem structure from the RFC 9162 section 4.5.
+type TransItem struct {
+	VersionedTransType int
+	Data               SignedCertificateTimestampDataV2
+}
+
+// SignedCertificateTimestampDataV2, from the RFC 9162 section 4.8.
+type SignedCertificateTimestampDataV2 struct {
+	LogID         asn1.ObjectIdentifier
+	Timestamp     int
+	SCTExtensions []CTExtension
+	Signature     []byte
+}
+
+// CreateSCT creates a two dummy SCTs for the `template` and signed by `parent`, returning an extension containing both of them.
+func CreateSCT(rand io.Reader, template, parent *Certificate, pub, priv interface{}) (pkix.Extension, error) {
+
+	var dummyExt pkix.Extension
+
+	tbsCertSignature1, err := sctSignTBSCertificate(rand, template, parent, pub, priv)
+	if err != nil {
+		return dummyExt, err
+	}
+
+	ti1 := TransItem{
+		x509_sct_v2,
+		SignedCertificateTimestampDataV2{
+			LogID:         asn1.ObjectIdentifier{1, 1, 1, 1, 1, 1, 1, 1},
+			Timestamp:     time.Now().Nanosecond() / 1000,
+			SCTExtensions: []CTExtension{},
+			Signature:     tbsCertSignature1,
+		},
+	}
+
+	tbsCertSignature2, err := sctSignTBSCertificate(rand, template, parent, pub, priv)
+	if err != nil {
+		return dummyExt, err
+	}
+
+	ti2 := TransItem{
+		x509_sct_v2,
+		SignedCertificateTimestampDataV2{
+			LogID:         asn1.ObjectIdentifier{1, 1, 1, 1, 1, 1, 1, 2},
+			Timestamp:     time.Now().Nanosecond() / 1000,
+			SCTExtensions: []CTExtension{},
+			Signature:     tbsCertSignature2,
+		},
+	}
+
+	tiList := []TransItem{ti1, ti2}
+
+	return marshalSCT(tiList)
+}
+
+// sctSignTBSCertificate signs a TBSCertificate created from `template` using priv.
+func sctSignTBSCertificate(rand io.Reader, template, parent *Certificate, pub, priv interface{}) ([]byte, error) {
+
+	intCAPriv := priv.(crypto.Signer)
+
+	hashFunc, signatureAlgorithm, err := signingParamsForPublicKey(intCAPriv.Public(), template.SignatureAlgorithm)
+
+	asn1Issuer, err := subjectBytes(parent)
+	if err != nil {
+		return nil, err
+	}
+
+	asn1Subject, err := subjectBytes(template)
+	if err != nil {
+		return nil, err
+	}
+
+	publicKeyBytes, publicKeyAlgorithm, err := marshalPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+
+	encodedPublicKey := asn1.BitString{BitLength: len(publicKeyBytes) * 8, Bytes: publicKeyBytes}
+
+	authorityKeyId := template.AuthorityKeyId
+	if !bytes.Equal(asn1Issuer, asn1Subject) && len(parent.SubjectKeyId) > 0 {
+		authorityKeyId = parent.SubjectKeyId
+	}
+
+	subjectKeyId := template.SubjectKeyId
+	if len(subjectKeyId) == 0 && template.IsCA {
+		// SubjectKeyId generated using method 1 in RFC 5280, Section 4.2.1.2:
+		//   (1) The keyIdentifier is composed of the 160-bit SHA-1 hash of the
+		//   value of the BIT STRING subjectPublicKey (excluding the tag,
+		//   length, and number of unused bits).
+		h := sha1.Sum(publicKeyBytes)
+		subjectKeyId = h[:]
+	}
+
+	extensions, err := buildCertExtensions(template, bytes.Equal(asn1Subject, emptyASN1Subject), authorityKeyId, subjectKeyId)
+	if err != nil {
+		return nil, err
+	}
+
+	c := tbsCertificate{
+		Version:            2,
+		SerialNumber:       template.SerialNumber,
+		SignatureAlgorithm: signatureAlgorithm,
+		Issuer:             asn1.RawValue{FullBytes: asn1Issuer},
+		Validity:           validity{template.NotBefore.UTC(), template.NotAfter.UTC()},
+		Subject:            asn1.RawValue{FullBytes: asn1Subject},
+		PublicKey:          publicKeyInfo{nil, publicKeyAlgorithm, encodedPublicKey},
+		Extensions:         extensions,
+	}
+
+	tbsCertContents, err := asn1.Marshal(c)
+
+	// ... CA Sends precertificate to logs ...
+
+	toSign := tbsCertContents
+	if hashFunc != 0 {
+		h := hashFunc.New()
+		h.Write(toSign)
+		toSign = h.Sum(nil)
+	}
+
+	var signerOpts crypto.SignerOpts = hashFunc
+	if template.SignatureAlgorithm != 0 && template.SignatureAlgorithm.isRSAPSS() {
+		signerOpts = &rsa.PSSOptions{
+			SaltLength: rsa.PSSSaltLengthEqualsHash,
+			Hash:       hashFunc,
+		}
+	}
+
+	tbsCertSignature, err := intCAPriv.Sign(rand, toSign, signerOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	return tbsCertSignature, nil
+
+}
+
+func SignFromParams(rand io.Reader, signAlgo SignatureAlgorithm, toSign []byte, priv interface{}) ([]byte, pkix.AlgorithmIdentifier, error) {
+
+	signKey := priv.(crypto.Signer)
+
+	hashFunc, signatureAlgorithm, err := signingParamsForPublicKey(signKey.Public(), signAlgo)
+
+	if hashFunc != 0 {
+		h := hashFunc.New()
+		h.Write(toSign)
+		toSign = h.Sum(nil)
+	}
+
+	var signerOpts crypto.SignerOpts = hashFunc
+	if signAlgo != 0 && signAlgo.isRSAPSS() {
+		signerOpts = &rsa.PSSOptions{
+			SaltLength: rsa.PSSSaltLengthEqualsHash,
+			Hash:       hashFunc,
+		}
+	}
+
+	signature, err := signKey.Sign(rand, toSign, signerOpts)
+	if err != nil {
+		return nil, pkix.AlgorithmIdentifier{}, err
+	}
+
+	return signature, signatureAlgorithm, nil
+
+}
+
+func OidFromLiboqsSig(ID liboqs_sig.ID) asn1.ObjectIdentifier {
+	return oidSignatureFromSigID[ID]
 }

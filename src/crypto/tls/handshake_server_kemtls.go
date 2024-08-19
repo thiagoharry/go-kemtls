@@ -1,15 +1,22 @@
 package tls
 
 import (
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/kem"
 	"errors"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/combiner/xorMac"
+	dlp "gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/idkem/dlp2"
+	"gitlab.labsec.ufsc.br/equipe-icp/pqc/go-ibe-pqc/pkg/kem/ec"
 	"sync/atomic"
+	// Secret Print
+	//"fmt"
 )
 
 func (hs *serverHandshakeStateTLS13) handshakeKEMTLS() error {
 	c := hs.c
-
 	if hs.pdkKEMTLS {
 		if err := hs.writeKEMTLSServerFinished(); err != nil {
 			return err
@@ -22,6 +29,11 @@ func (hs *serverHandshakeStateTLS13) handshakeKEMTLS() error {
 			return err
 		}
 	} else {
+		if c.config.MpkExtension {
+			if err := hs.sendServerIBEExtension(); err != nil {
+				return err
+			}
+		}
 		if err := hs.readClientKEMCiphertext(); err != nil {
 			return err
 		}
@@ -56,27 +68,44 @@ func (hs *serverHandshakeStateTLS13) handshakeKEMTLS() error {
 }
 
 func (hs *serverHandshakeStateTLS13) readClientKEMCiphertext() error {
+	var sk *kem.PrivateKey
+	var ahs, ss []byte
+	var decapsulator combiner.HybridKEM
 	c := hs.c
-
-	var ahs []byte
-
 	if !(hs.pdkKEMTLS && hs.keyKEMShare) {
-		var sk *kem.PrivateKey
-		var ok, ok1 bool
-		sk, ok = hs.cert.PrivateKey.(*kem.PrivateKey)
-		if !ok {
-			sk, ok1 = hs.cert.DelegatedCredentialPrivateKey.(*kem.PrivateKey)
-			if !ok1 {
+		if hs.hybridIBEKEMTLS {
+			skECDSA, ok := hs.cert.PrivateKey.(*ecdsa.PrivateKey)
+			if !ok {
 				c.sendAlert(alertInternalError)
 				return errors.New("crypto/tls: private key unexpectedly of wrong type")
 			}
-		}
+			combiner := new(xormac.Combiner)
+			scheme, err := combiner.NewScheme(new(ec.Scheme), new(dlp.Scheme))
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return errors.New("crypto/tls: couldn't generate hybrid scheme")
+			}
+			decapsulator, err = scheme.Decapsulator(skECDSA.D.Bytes(), c.config.SkID)
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return errors.New("crypto/tls: couldn't generate hybrid decapsulator")
+			}
 
+		} else {
+			var ok, ok1 bool
+			sk, ok = hs.cert.PrivateKey.(*kem.PrivateKey)
+			if !ok {
+				sk, ok1 = hs.cert.DelegatedCredentialPrivateKey.(*kem.PrivateKey)
+				if !ok1 {
+					c.sendAlert(alertInternalError)
+					return errors.New("crypto/tls: private key unexpectedly of wrong type")
+				}
+			}
+		}
 		msg, err := c.readHandshake()
 		if err != nil {
 			return err
 		}
-
 		kexMsg, ok := msg.(*clientKeyExchangeMsg)
 		if !ok {
 			c.sendAlert(alertUnexpectedMessage)
@@ -85,11 +114,19 @@ func (hs *serverHandshakeStateTLS13) readClientKEMCiphertext() error {
 
 		hs.transcript.Write(kexMsg.marshal())
 		hs.handshakeTimings.ReadKEMCiphertext = hs.handshakeTimings.elapsedTime()
-
-		ss, err := kem.Decapsulate(sk, kexMsg.ciphertext)
-		if err != nil {
-			return err
+		if hs.hybridIBEKEMTLS {
+			ss, err = decapsulator.Decaps(c.config.ServerName, kexMsg.ciphertext)
+			if err != nil {
+				return err
+			}
+		} else {
+			ss, err = kem.Decapsulate(sk, kexMsg.ciphertext)
+			if err != nil {
+				return err
+			}
 		}
+		// Secret Print
+		//fmt.Printf("Server Auth (server side)\nKEMId: %x\nsharedKey:\n  %x\n\n", sk.KEMId, ss)
 
 		// derive AHS
 		// AHS <- HKDF.Extract(dHS, ss_s)
@@ -194,6 +231,41 @@ func (hs *serverHandshakeStateTLS13) readClientKEMCertificate() error {
 	return nil
 }
 
+func (hs *serverHandshakeStateTLS13) sendServerIBEExtension() error {
+	c := hs.c
+	sk, ok := hs.cert.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		c.sendAlert(alertInternalError)
+		return errors.New("crypto/tls: private key unexpectedly of wrong type")
+	}
+	hash := crypto.SHA256.New()
+	hash.Write(c.config.Mpk)
+	digest := hash.Sum(nil)
+	opts := crypto.SignerOpts(crypto.SHA256)
+	signed, err := sk.Sign(c.config.rand(), digest, opts)
+	if err != nil {
+		c.sendAlert(alertInternalError)
+		return errors.New("crypto/tls: failed to sign IBEExtension")
+	}
+	msg := serverIBEExtensionMsg{
+		raw:                nil,
+		key:                c.config.Mpk,
+		signatureAlgorithm: 0x0304,
+		signature:          signed,
+	}
+	marshalledServerIBE := msg.marshal()
+	_, err = c.writeRecord(recordTypeHandshake, marshalledServerIBE)
+	if err != nil {
+		return err
+	}
+	_, err = hs.transcript.Write(marshalledServerIBE)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (hs *serverHandshakeStateTLS13) sendServerKEMCiphertext() error {
 	c := hs.c
 
@@ -227,19 +299,32 @@ func (hs *serverHandshakeStateTLS13) sendServerKEMCiphertext() error {
 		return err
 	}
 
+	// Secret Print
+	// fmt.Printf("Client Auth (server side)\nKEMId: %x\nsharedKey:\n  %x\n\n", pk.KEMId, ss)
+
 	msg := serverKeyExchangeMsg{
 		raw: nil,
 		key: ct,
 	}
 
-	_, err = c.writeRecord(recordTypeHandshake, msg.marshal())
+	marshalledServerKEMCT := msg.marshal()
+
+	_, err = c.writeRecord(recordTypeHandshake, marshalledServerKEMCT)
 	if err != nil {
 		return err
 	}
-	_, err = hs.transcript.Write(msg.marshal())
+	_, err = hs.transcript.Write(marshalledServerKEMCT)
 	if err != nil {
 		return err
 	}
+
+	serverKEMCTSize, err := getMessageLength(marshalledServerKEMCT)
+	if err != nil {
+		return err
+	}
+
+	hs.c.serverHandshakeSizes.ServerKEMCiphertext = serverKEMCTSize
+
 	hs.handshakeTimings.WriteKEMCiphertext = hs.handshakeTimings.elapsedTime()
 
 	// MS <- HKDF.Extract(dAHS, ssC)
@@ -303,14 +388,23 @@ func (hs *serverHandshakeStateTLS13) writeKEMTLSServerFinished() error {
 		verifyData: hs.suite.finishedHashKEMTLS(hs.masterSecret, "s", hs.transcript),
 	}
 
-	if _, err := hs.transcript.Write(finished.marshal()); err != nil {
+	marshalledFinished := finished.marshal()
+
+	if _, err := hs.transcript.Write(marshalledFinished); err != nil {
 		return err
 	}
-	if _, err := c.writeRecord(recordTypeHandshake, finished.marshal()); err != nil {
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledFinished); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteServerFinished = hs.handshakeTimings.elapsedTime()
+
+	finishedSize, err1 := getMessageLength(marshalledFinished)
+	if err1 != nil {
+		return err1
+	}
+
+	hs.c.serverHandshakeSizes.Finished = finishedSize
 
 	// SATS <- HKDF.Expand(MS, "s ap traffic", CH..SF)
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,

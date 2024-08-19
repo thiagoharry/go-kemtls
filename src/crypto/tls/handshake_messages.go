@@ -313,6 +313,7 @@ func (m *clientHelloMsg) marshal() []byte {
 				b.AddUint16(extensionEarlyData)
 				b.AddUint16(0) // empty extension_data
 			}
+
 			if len(m.pskModes) > 0 {
 				// RFC 8446, Section 4.2.9
 				b.AddUint16(extensionPSKModes)
@@ -647,6 +648,7 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				}
 				m.keyShares = append(m.keyShares, ks)
 			}
+
 		case extensionEarlyData:
 			// RFC 8446, Section 4.2.10
 			m.earlyData = true
@@ -1473,6 +1475,51 @@ type certificateMsgTLS13 struct {
 	delegatedCredential bool
 }
 
+// When the cached info specification is used, then a modified version
+// of the Certificate message is exchanged. The modified structure is
+// shown in Figure 1.
+
+// struct {
+// 	opaque hash_value<1..255>;
+// } Certificate;
+
+// Figure 1: Cached Info Certificate Message
+
+type certificateMsgTLS13CachedInfo struct {
+	raw        []byte
+	hash_value []byte
+}
+
+func (m *certificateMsgTLS13CachedInfo) marshal() []byte {
+	if m.raw != nil {
+		return m.raw
+	}
+
+	var b cryptobyte.Builder
+
+	b.AddUint8(typeCertificateCachedInfo)
+	b.AddUint24(32) // Length prefixed value
+	b.AddBytes(m.hash_value)
+
+	m.raw = b.BytesOrPanic()
+
+	return m.raw
+}
+
+func (m *certificateMsgTLS13CachedInfo) unmarshal(data []byte) bool {
+	*m = certificateMsgTLS13CachedInfo{raw: data}
+	s := cryptobyte.String(data)
+	var hash_value []byte
+
+	// s.Skip(4) skips message type and 24 bit length prefix
+	if !s.Skip(4) || !s.ReadBytes(&hash_value, 32) {
+		return false
+	}
+
+	m.hash_value = hash_value
+	return true
+}
+
 func (m *certificateMsgTLS13) marshal() []byte {
 	if m.raw != nil {
 		return m.raw
@@ -1628,6 +1675,44 @@ func unmarshalCertificate(s *cryptobyte.String, certificate *Certificate) bool {
 			}
 		}
 	}
+	return true
+}
+
+type serverIBEExtensionMsg struct {
+	raw                []byte
+	key                []byte
+	signatureAlgorithm SignatureScheme
+	signature          []byte
+}
+
+func (m *serverIBEExtensionMsg) marshal() []byte {
+	if m.raw != nil {
+		return m.raw
+	}
+	// OLD: H: 4096, rkey: 128, ecdsa sig: 64, sig type: 2
+	// OLD: H: 3584, rkey: 128, ecdsa sig: 64, sig type: 2
+	length := 3584 + len(m.signature) + 2
+	x := make([]byte, length+4)
+	x[0] = typeIBEExtension
+	x[1] = uint8(length >> 16)
+	x[2] = uint8(length >> 8)
+	x[3] = uint8(length)
+	// type ECDSA:
+	x[4] = uint8(4)
+	x[5] = uint8(3)
+	copy(x[6:], m.key)
+	copy(x[3590:], m.signature)
+	m.raw = x
+	return x
+}
+
+func (m *serverIBEExtensionMsg) unmarshal(data []byte) bool {
+	m.raw = data
+	if len(data) < 3590 {
+		return false
+	}
+	m.key = data[6:3590]
+	m.signature = data[3590:]
 	return true
 }
 

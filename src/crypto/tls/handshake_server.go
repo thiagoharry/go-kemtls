@@ -6,11 +6,13 @@ package tls
 
 import (
 	circlSign "circl/sign"
+	"os"
 
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/kem"
+	"crypto/liboqs_sig"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
@@ -50,8 +52,19 @@ func (c *Conn) serverHandshake() error {
 		hs := serverHandshakeStateTLS13{
 			c:                c,
 			clientHello:      clientHello,
-			handshakeTimings: createTLS13ServerHandshakeTimingInfo(c.config.Time),
+			handshakeTimings: createTLS13ServerHandshakeTimingInfo(c.config.Time),			
 		}
+		
+		if c.config.OCSPResponseFilePath != "" {
+			ocspResponse, err := os.ReadFile(c.config.OCSPResponseFilePath)
+			if err != nil {
+				panic(err)
+			}
+
+			hs.ocspResponse = ocspResponse
+		}
+		
+		c.serverHandshakeSizes = TLS13ServerHandshakeSizes{}
 		return hs.handshake()
 	}
 
@@ -64,11 +77,9 @@ func (c *Conn) serverHandshake() error {
 
 func (hs *serverHandshakeState) handshake() error {
 	c := hs.c
-
 	if err := hs.processClientHello(); err != nil {
 		return err
 	}
-
 	// For an overview of TLS handshaking, see RFC 5246, Section 7.3.
 	c.buffering = true
 	if hs.checkForResumption() {
@@ -138,7 +149,6 @@ func (c *Conn) readClientHello() (*clientHelloMsg, error) {
 		c.sendAlert(alertUnexpectedMessage)
 		return nil, unexpectedMessageError(clientHello, msg)
 	}
-
 	// NOTE(cjpatton): ECH usage is resolved before calling GetConfigForClient()
 	// or GetCertifciate(). Hence, it is not currently possible to reject ECH if
 	// we don't recognize the inner SNI. This may or may not be desirable in the
@@ -173,13 +183,11 @@ func (c *Conn) readClientHello() (*clientHelloMsg, error) {
 	c.haveVers = true
 	c.in.version = c.vers
 	c.out.version = c.vers
-
 	return clientHello, nil
 }
 
 func (hs *serverHandshakeState) processClientHello() error {
 	c := hs.c
-
 	hs.hello = new(serverHelloMsg)
 	hs.hello.vers = c.vers
 
@@ -707,6 +715,7 @@ func (hs *serverHandshakeState) readFinished(out []byte) error {
 	verify := hs.finishedHash.clientSum(hs.masterSecret)
 	if len(verify) != len(clientFinished.verifyData) ||
 		subtle.ConstantTimeCompare(verify, clientFinished.verifyData) != 1 {
+		fmt.Printf("HANDSHAKE FAILURE ####################################\n")
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("tls: client's Finished message is incorrect")
 	}
@@ -824,7 +833,7 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 
 	if len(certs) > 0 {
 		switch certs[0].PublicKey.(type) {
-		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey, circlSign.PublicKey, *kem.PublicKey:
+		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey, circlSign.PublicKey, *kem.PublicKey, *liboqs_sig.PublicKey:
 		default:
 			c.sendAlert(alertUnsupportedCertificate)
 			return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)

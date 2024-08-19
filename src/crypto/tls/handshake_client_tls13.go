@@ -9,6 +9,7 @@ import (
 	"crypto"
 	"crypto/hmac"
 	"crypto/kem"
+	"crypto/liboqs_sig"
 	"crypto/rsa"
 	"crypto/x509"
 	"errors"
@@ -40,6 +41,7 @@ type clientHandshakeStateTLS13 struct {
 	ssKEMTLS           []byte
 	isClientAuthKEMTLS bool
 	certKEMTLS         *Certificate // only for KEMTLS
+	hybridIBEKEMTLS    bool         // For hybrid scheme
 
 	suite           *cipherSuiteTLS13
 	transcript      hash.Hash
@@ -94,14 +96,12 @@ func (hs *clientHandshakeStateTLS13) processDelegatedCredentialFromServer(rawDC 
 // optionally, hs.session, hs.earlySecret and hs.binderKey to be set.
 func (hs *clientHandshakeStateTLS13) handshake() error {
 	c := hs.c
-
 	// The server must not select TLS 1.3 in a renegotiation. See RFC 8446,
 	// sections 4.1.2 and 4.1.3.
 	if c.handshakes > 0 {
 		c.sendAlert(alertProtocolVersion)
 		return errors.New("tls: server selected TLS 1.3 in a renegotiation")
 	}
-
 	// Consistency check on the presence of a keyShare and its parameters.
 	if hs.keyShare == nil || len(hs.hello.keyShares) != len(hs.keyShare) {
 		return c.sendAlert(alertInternalError)
@@ -111,8 +111,17 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		return err
 	}
 
+	marshalledHello := hs.hello.marshal()
+
+	clientHelloSize, err := getMessageLength(marshalledHello)
+	if err != nil {
+		return err
+	}
+
+	hs.c.clientHandshakeSizes.ClientHello = clientHelloSize
+
 	hs.transcript = hs.suite.hash.New()
-	hs.transcript.Write(hs.hello.marshal())
+	hs.transcript.Write(marshalledHello)
 
 	// When offering ECH, it is not known whether ECH was accepted until the
 	// ServerHello is processed. In particular, we do not know at this point if
@@ -121,7 +130,6 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		hs.transcriptInner = hs.suite.hash.New()
 		hs.transcriptInner.Write(hs.helloInner.marshal())
 	}
-
 	if bytes.Equal(hs.serverHello.random, helloRetryRequestRandom) {
 		if err := hs.sendDummyChangeCipherSpec(); err != nil {
 			return err
@@ -168,6 +176,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 
 	// hs.handshakeTimings.ExperimentName = experimentName(c)
 	hs.handshakeTimings.finish()
+	hs.handshakeTimings.SendAppData = hs.handshakeTimings.FullProtocol
 	c.handleCFEvent(hs.handshakeTimings)
 	atomic.StoreUint32(&c.handshakeStatus, 1)
 
@@ -315,7 +324,8 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			}
 
 		}
-
+		//fmt.Printf("\n-----\ncurveID.isKEM: %v\nc.config.KEMTLSEnabled: %v\nc.config.PQTLSEnabled: %v\n-----\n",
+		//	curveID.isKEM(), c.config.KEMTLSEnabled, c.config.PQTLSEnabled)
 		if curveID.isKEM() && (c.config.KEMTLSEnabled || c.config.PQTLSEnabled) {
 			kemID := kem.ID(curveID)
 			pk, sk, err := kem.GenerateKey(c.config.rand(), kemID)
@@ -496,7 +506,6 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
 
 func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 	c := hs.c
-
 	var sharedKey []byte
 	for _, keyShare := range hs.keyShare {
 		if params, ok := keyShare.(ecdheParameters); ok && params.CurveID() == hs.serverHello.serverShare.group {
@@ -569,7 +578,6 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		c.sendAlert(alertInternalError)
 		return err
 	}
-
 	return nil
 }
 
@@ -629,7 +637,7 @@ func isKEMTLSAuthUsed(peerCertificate *x509.Certificate, cert Certificate) bool 
 	}
 
 	if kemPriv, ok := peerCertificate.PublicKey.(*kem.PublicKey); ok {
-		if kemPriv.KEMId == kem.SIKEp434 || kemPriv.KEMId == kem.Kyber512 {
+		if kemPriv.KEMId == kem.SIKEp434 || kemPriv.KEMId == kem.Kyber512 || kem.IsLiboqs(kemPriv.KEMId) == kemPriv.KEMId {
 			return true
 		}
 	}
@@ -649,8 +657,8 @@ func isPQTLSAuthUsed(peerCertificate *x509.Certificate, cert Certificate) bool {
 		}
 	}
 
-	if kemPriv, ok := peerCertificate.PublicKey.(*kem.PublicKey); ok {
-		if kemPriv.KEMId == kem.SIKEp434 || kemPriv.KEMId == kem.Kyber512 {
+	if hybridPQCPub, ok := peerCertificate.PublicKey.(*liboqs_sig.PublicKey); ok {
+		if hybridPQCPub.SigId >= liboqs_sig.P256_Dilithium2 && hybridPQCPub.SigId <= liboqs_sig.SphincsShake256sSimple {
 			return true
 		}
 	}
@@ -658,8 +666,10 @@ func isPQTLSAuthUsed(peerCertificate *x509.Certificate, cert Certificate) bool {
 	return false
 }
 
+// readServerCertificate
 func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 	c := hs.c
+	var certMsg *certificateMsgTLS13
 
 	if hs.pdkKEMTLS && hs.keyKEMShare {
 		hs.isKEMTLS = true
@@ -697,22 +707,74 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 			return err
 		}
 	}
+	if hs.serverHello.cachedInformationCert {
+		cachedCertMsg, ok := msg.(*certificateMsgTLS13CachedInfo)
+		if !ok {
+			c.sendAlert(alertUnexpectedMessage)
+			return unexpectedMessageError(cachedCertMsg, msg)
+		}
 
-	certMsg, ok := msg.(*certificateMsgTLS13)
-	if !ok {
-		c.sendAlert(alertUnexpectedMessage)
-		return unexpectedMessageError(certMsg, msg)
-	}
-	if len(certMsg.certificate.Certificate) == 0 {
-		c.sendAlert(alertDecodeError)
-		return errors.New("tls: received empty certificates message")
-	}
-	hs.transcript.Write(certMsg.marshal())
+		hs.transcript.Write(cachedCertMsg.marshal())
 
+		certMsg = new(certificateMsgTLS13)
+
+		data := append([]byte(nil), hs.c.config.CachedCert...)
+
+		if !certMsg.unmarshal(data) {
+			return errors.New("tls: wrong cached certificates message")
+		}
+
+		if len(certMsg.certificate.Certificate) == 0 {
+			c.sendAlert(alertDecodeError)
+			return errors.New("tls: wrong cached certificates message")
+		}
+
+	} else {
+		certMsg, ok = msg.(*certificateMsgTLS13)
+		if !ok {
+			c.sendAlert(alertUnexpectedMessage)
+			return unexpectedMessageError(certMsg, msg)
+		}
+		if len(certMsg.certificate.Certificate) == 0 {
+			c.sendAlert(alertDecodeError)
+			return errors.New("tls: received empty certificates message")
+		}
+		hs.transcript.Write(certMsg.marshal())
+	}
 	hs.handshakeTimings.ReadCertificate = hs.handshakeTimings.elapsedTime()
 
 	c.scts = certMsg.certificate.SignedCertificateTimestamps
 	c.ocspResponse = certMsg.certificate.OCSPStaple
+
+	/* ----------------------------------- ... ---------------------------------- */
+
+	// Code snippet to print the certificate chain received from the server. Useful to debug certificate chain verification problems.
+
+	// serverCertificates := make([]*x509.Certificate, len(certMsg.certificate.Certificate))
+	// for i := 0; i < len(certMsg.certificate.Certificate); i++ {
+	// 	cert, err := x509.ParseCertificate(certMsg.certificate.Certificate[i])
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	serverCertificates[i] = cert
+	// 	fmt.Printf("Subject: %s   ---  Issued by: %s\n", serverCertificates[i].Subject.CommonName, serverCertificates[i].Issuer.CommonName)
+	// }
+
+	// fmt.Println("RootCA's")
+	// if c.config.RootCAs != nil {
+	// 	rootCert, err := c.config.RootCAs.Cert(0)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+
+	// 	fmt.Printf("Subject: %s   ---  Issued by: %s\n", rootCert.Subject.CommonName, rootCert.Issuer.CommonName)
+	// } else {
+	// 	fmt.Println("is NIL")
+	// }
+
+	// fmt.Println("End")
+
+	/* ----------------------------------- ... ---------------------------------- */
 
 	if err := c.verifyServerCertificate(certMsg.certificate.Certificate); err != nil {
 		return err
@@ -722,9 +784,17 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 		if hs.keyKEMShare {
 			c.didPQTLS = true
 		}
+	} else if c.config.PQTLSEnabled {
+		if hs.keyKEMShare {
+			c.didPQTLS = true
+		}
 	}
-
-	if isKEMTLSAuthUsed(c.peerCertificates[0], certMsg.certificate) {
+	// XXX: Should run this part or not?
+	if isKEMTLSAuthUsed(c.peerCertificates[0], certMsg.certificate) || c.config.HybridIBEKEMTLSEnabled {
+		if c.config.HybridIBEKEMTLSEnabled {
+			hs.isKEMTLS = true
+			hs.hybridIBEKEMTLS = true
+		}
 		if certMsg.delegatedCredential {
 			if err := hs.processDelegatedCredentialFromServer(certMsg.certificate.DelegatedCredential, nil); err != nil {
 				return err
@@ -743,7 +813,6 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 		if err != nil {
 			return err
 		}
-
 		certVerify, ok := msg.(*certificateVerifyMsg)
 		if !ok {
 			c.sendAlert(alertUnexpectedMessage)
@@ -923,12 +992,21 @@ func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {
 	certMsg.ocspStapling = hs.certReq.ocspStapling && len(cert.OCSPStaple) > 0
 	certMsg.delegatedCredential = hs.certReq.supportDelegatedCredential && len(cert.DelegatedCredential) > 0
 
-	hs.transcript.Write(certMsg.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, certMsg.marshal()); err != nil {
+	marshalledCertificate := certMsg.marshal()
+
+	hs.transcript.Write(marshalledCertificate)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledCertificate); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteCertificate = hs.handshakeTimings.elapsedTime()
+
+	certificateSize, err := getMessageLength(marshalledCertificate)
+	if err != nil {
+		return err
+	}
+
+	hs.c.clientHandshakeSizes.Certificate = certificateSize
 
 	// If we sent an empty certificate message, skip the CertificateVerify.
 	if len(cert.Certificate) == 0 {
@@ -993,19 +1071,29 @@ func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {
 
 	certVerifyMsg.signature = sig
 
-	hs.transcript.Write(certVerifyMsg.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, certVerifyMsg.marshal()); err != nil {
+	marshalledCertVerify := certVerifyMsg.marshal()
+
+	hs.transcript.Write(marshalledCertVerify)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledCertVerify); err != nil {
 		return err
 	}
 
 	c.didClientAuthentication = true
 	hs.handshakeTimings.WriteCertificateVerify = hs.handshakeTimings.elapsedTime()
 
+	certVerifySize, err := getMessageLength(marshalledCertVerify)
+	if err != nil {
+		return err
+	}
+
+	hs.c.clientHandshakeSizes.CertificateVerify = certVerifySize
+
 	c.certificateReqMessage = hs.certReq.marshal()
 
 	return nil
 }
 
+// sendClientFinished
 func (hs *clientHandshakeStateTLS13) sendClientFinished() error {
 	c := hs.c
 
@@ -1017,12 +1105,21 @@ func (hs *clientHandshakeStateTLS13) sendClientFinished() error {
 		verifyData: hs.suite.finishedHash(c.out.trafficSecret, hs.transcript),
 	}
 
-	hs.transcript.Write(finished.marshal())
-	if _, err := c.writeRecord(recordTypeHandshake, finished.marshal()); err != nil {
+	marshalledFinished := finished.marshal()
+
+	hs.transcript.Write(marshalledFinished)
+	if _, err := c.writeRecord(recordTypeHandshake, marshalledFinished); err != nil {
 		return err
 	}
 
 	hs.handshakeTimings.WriteClientFinished = hs.handshakeTimings.elapsedTime()
+
+	finishedSize, err := getMessageLength(marshalledFinished)
+	if err != nil {
+		return err
+	}
+
+	hs.c.clientHandshakeSizes.Finished = finishedSize
 
 	c.out.setTrafficSecret(hs.suite, hs.trafficSecret)
 

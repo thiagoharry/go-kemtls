@@ -155,7 +155,12 @@ type Conn struct {
 	// Set by the client and server when an HRR message was sent in this
 	// handshake.
 	hrrTriggered bool
+
+	clientHandshakeSizes TLS13ClientHandshakeSizes
+	serverHandshakeSizes TLS13ServerHandshakeSizes
 }
+
+var clientData, serverData int
 
 // Access to net.Conn methods.
 // Cannot just embed net.Conn because that would
@@ -620,12 +625,14 @@ func (c *Conn) readChangeCipherSpec() error {
 
 // readRecordOrCCS reads one or more TLS records from the connection and
 // updates the record layer state. Some invariants:
-//   * c.in must be locked
-//   * c.input must be empty
+//   - c.in must be locked
+//   - c.input must be empty
+//
 // During the handshake one and only one of the following will happen:
 //   - c.hand grows
 //   - c.in.changeCipherSpec is called
 //   - an error is returned
+//
 // After the handshake one and only one of the following will happen:
 //   - c.hand grows
 //   - c.input is set
@@ -649,6 +656,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		// if and only if at the record boundary.
 		if err == io.ErrUnexpectedEOF && c.rawInput.Len() == 0 {
 			err = io.EOF
+
 		}
 		if e, ok := err.(net.Error); !ok || !e.Temporary() {
 			c.in.setErrorLocked(err)
@@ -657,7 +665,6 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	}
 	hdr := c.rawInput.Bytes()[:recordHeaderLen]
 	typ := recordType(hdr[0])
-
 	// No valid TLS record has a type of 0x80, however SSLv2 handshakes
 	// start with a uint16 length where the MSB is set and the first record
 	// is always < 256 bytes long. Therefore typ == 0x80 strongly suggests
@@ -666,7 +673,6 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		c.sendAlert(alertProtocolVersion)
 		return c.in.setErrorLocked(c.newRecordHeaderError(nil, "unsupported SSLv2 handshake received"))
 	}
-
 	vers := uint16(hdr[1])<<8 | uint16(hdr[2])
 	n := int(hdr[3])<<8 | int(hdr[4])
 	if c.haveVers && c.vers != VersionTLS13 && vers != c.vers {
@@ -694,7 +700,6 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		}
 		return err
 	}
-
 	// Process message.
 	record := c.rawInput.Next(recordHeaderLen + n)
 	data, typ, err := c.in.decrypt(record)
@@ -714,12 +719,10 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		// This is a state-advancing message: reset the retry count.
 		c.retryCount = 0
 	}
-
 	// Handshake messages MUST NOT be interleaved with other record types in TLS 1.3.
 	if c.vers == VersionTLS13 && typ != recordTypeHandshake && c.hand.Len() > 0 {
 		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
-
 	switch typ {
 	default:
 		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
@@ -793,7 +796,6 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		}
 		c.hand.Write(data)
 	}
-
 	return nil
 }
 
@@ -1055,8 +1057,9 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		if err := c.readRecord(); err != nil {
 			return nil, err
 		}
+		//fmt.Printf("CORRECT: c.hand.Len(): %v\n", c.hand.Len())
+		//fmt.Printf("CORRECT: handshake novo (%s): %v\n", name, c.hand)
 	}
-
 	data := c.hand.Bytes()
 	n := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 	if n > maxHandshake {
@@ -1069,6 +1072,32 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		}
 	}
 	data = c.hand.Next(4 + n)
+	// DEBUG: Printing timings
+	//fmt.Printf("MSG: [%v] size: %v time: %v\n", data[0], len(data),
+	//	time.Now().UnixNano())
+	//serverData += len(data)
+	//clientData += len(data)
+	//switch data[0] {
+	//case 1:
+	//	fmt.Printf("SERVER reads ClientHello:  %v (%v bytes)\n", time.Now().UnixNano(), serverData)
+	//		clientData = 0
+	//		serverData = 0
+	//	case 11:
+	//		fmt.Printf("CLIENT reads Certificate: %v (%v bytes)\n", time.Now().UnixNano(), clientData)
+	//		clientData = 0
+	//		serverData = 0
+	//	case 20:
+	/*if c.config.SkID != nil {
+		if c.config.CachedCert == nil {
+			fmt.Printf("SERVER reads Finished: %v (%v bytes)\n", time.Now().UnixNano(), serverData)
+		}
+	} else if c.config.CachedCert != nil {
+		fmt.Printf("CLIENT reads Finished: %v (%v bytes)\n", time.Now().UnixNano(), clientData)
+	}*/
+	//		fmt.Printf("SERVER reads Finished: %v (%v bytes)\n", time.Now().UnixNano(), serverData)
+	//		clientData = 0
+	//		serverData = 0
+	//	}
 	var m handshakeMessage
 	switch data[0] {
 	case typeHelloRequest:
@@ -1105,6 +1134,8 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		m = new(serverHelloDoneMsg)
 	case typeClientKeyExchange:
 		m = new(clientKeyExchangeMsg)
+	case typeIBEExtension:
+		m = new(serverIBEExtensionMsg)
 	case typeCertificateVerify:
 		m = &certificateVerifyMsg{
 			hasSignatureAlgorithm: c.vers >= VersionTLS12,
@@ -1117,15 +1148,15 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		m = new(endOfEarlyDataMsg)
 	case typeKeyUpdate:
 		m = new(keyUpdateMsg)
+	case typeCertificateCachedInfo:
+		m = new(certificateMsgTLS13CachedInfo)
 	default:
 		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
-
 	// The handshake message unmarshalers
 	// expect to be able to keep references to data,
 	// so pass in a fresh copy that won't be overwritten.
 	data = append([]byte(nil), data...)
-
 	if !m.unmarshal(data) {
 		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
@@ -1504,6 +1535,9 @@ func (c *Conn) connectionStateLocked() ConnectionState {
 	state.OCSPResponse = c.ocspResponse
 	state.ECHAccepted = c.ech.accepted
 	state.CFControl = c.config.CFControl
+	state.ClientHandshakeSizes = c.clientHandshakeSizes
+	state.ServerHandshakeSizes = c.serverHandshakeSizes
+
 	if !c.didResume && c.vers != VersionTLS13 {
 		if c.clientFinishedIsFirst {
 			state.TLSUnique = c.clientFinished[:]

@@ -281,7 +281,7 @@ func (test *clientTest) run(t *testing.T, write bool) {
 	var childProcess *exec.Cmd
 	var stdin opensslInput
 	var stdout *opensslOutputSink
-
+	//t.Skip("XXX")
 	if write {
 		var err error
 		recordingConn, childProcess, stdin, stdout, err = test.connFromCommand()
@@ -528,6 +528,7 @@ func runClientTestTLS13(t *testing.T, template *clientTest) {
 }
 
 func TestHandshakeClientRSARC4(t *testing.T) {
+	//t.Skip("XXX")
 	test := &clientTest{
 		name: "RSA-RC4",
 		args: []string{"-cipher", "RC4-SHA"},
@@ -538,6 +539,7 @@ func TestHandshakeClientRSARC4(t *testing.T) {
 }
 
 func TestHandshakeClientRSAAES128GCM(t *testing.T) {
+	//t.Skip("XXX")
 	test := &clientTest{
 		name: "AES128-GCM-SHA256",
 		args: []string{"-cipher", "AES128-GCM-SHA256"},
@@ -546,6 +548,7 @@ func TestHandshakeClientRSAAES128GCM(t *testing.T) {
 }
 
 func TestHandshakeClientRSAAES256GCM(t *testing.T) {
+	//t.Skip("XXX")
 	test := &clientTest{
 		name: "AES256-GCM-SHA384",
 		args: []string{"-cipher", "AES256-GCM-SHA384"},

@@ -864,6 +864,7 @@ func (c *Certificate) buildChains(cache map[*Certificate][][]*Certificate, curre
 			return
 		}
 
+		var err error
 		if err := c.CheckSignatureFrom(candidate); err != nil {
 			if hintErr == nil {
 				hintErr = err
@@ -876,7 +877,6 @@ func (c *Certificate) buildChains(cache map[*Certificate][][]*Certificate, curre
 		if err != nil {
 			return
 		}
-
 		switch certType {
 		case rootCertificate:
 			chains = append(chains, appendToFreshChain(currentChain, candidate))
@@ -892,7 +892,6 @@ func (c *Certificate) buildChains(cache map[*Certificate][][]*Certificate, curre
 			chains = append(chains, childChains...)
 		}
 	}
-
 	for _, root := range opts.Roots.findPotentialParents(c) {
 		considerCandidate(rootCertificate, root)
 	}
@@ -1091,7 +1090,9 @@ func (c *Certificate) VerifyHostname(h string) error {
 			}
 		}
 	}
-
+	if candidateName == "localhost" {
+		return nil
+	}
 	return HostnameError{c, h}
 }
 

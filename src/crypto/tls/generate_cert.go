@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("Missing required --host parameter")
 	}
 
-	var priv interface{}
+	var priv, pub interface{}
 	var err error
 	switch *ecdsaCurve {
 	case "":
@@ -71,7 +71,7 @@ func main() {
 			if scheme == nil {
 				log.Fatalf("No such Circl scheme: %s", scheme)
 			}
-			_, priv, err = scheme.GenerateKey()
+			pub, priv, err = scheme.GenerateKey()
 		} else {
 			priv, err = rsa.GenerateKey(rand.Reader, *rsaBits)
 		}
@@ -154,7 +154,11 @@ func main() {
 		template.KeyUsage |= x509.KeyUsageDigitalSignature
 	}
 
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(priv), priv)
+	if *circlKey == "" {
+		pub = publicKey(priv)
+	}
+	
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %v", err)
 	}

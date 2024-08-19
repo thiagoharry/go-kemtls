@@ -35,6 +35,14 @@ func ParseECPrivateKey(der []byte) (*ecdsa.PrivateKey, error) {
 	return parseECPrivateKey(nil, der)
 }
 
+func ParseECPrivateKeyWithOID(namedCurveOID *asn1.ObjectIdentifier, der []byte) (*ecdsa.PrivateKey, error) {
+	return parseECPrivateKey(namedCurveOID, der)
+}
+
+func OidFromNamedCurve(curve elliptic.Curve) (asn1.ObjectIdentifier, bool) {
+	return oidFromNamedCurve(curve)
+}
+
 // MarshalECPrivateKey converts an EC private key to SEC 1, ASN.1 DER form.
 //
 // This kind of key is commonly encoded in PEM blocks of type "EC PRIVATE KEY".
