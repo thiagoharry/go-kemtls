@@ -10,7 +10,7 @@ existing keys and certificates.
 to prototype our protocol and measure its performance.
 
 The results of our experiments are in the CSV stored in the `data` directory. The python
-scripts used to create graphics for our paper is also there.
+scripts used to create graphics for our paper are also there.
 
 ## Compiling
 
